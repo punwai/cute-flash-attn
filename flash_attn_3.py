@@ -10,8 +10,7 @@ import cutlass.utils.pipeline as pipeline
 import cutlass.torch as cutlass_torch
 import cutlass.cute as cute
 import cutlass.utils as utils
-import cutlass.utils.blackwell_helpers as sm90_utils
-import cutlass.utils.hopper_helpers as sm100_utils
+import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32
 
 class HopperFusedMultiHeadAttentionForward:
@@ -41,12 +40,54 @@ class HopperFusedMultiHeadAttentionForward:
     def kernel(
         self,
         q: cutlass_torch.Tensor,
+        tma_atom_q: cute.Atom,
         k: cutlass_torch.Tensor,
+        tma_atom_k: cute.Atom,
         v: cutlass_torch.Tensor,
+        tma_atom_v: cute.Atom,
+        o: cutlass_torch.Tensor,
+        tma_atom_o: cute.Atom,
     ):
+        warp_idx = cute.arch.warp_idx()
+        warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+        # /////////////////////////////////////////
+        #  Prefetch Tma descriptor
+        # /////////////////////////////////////////
+
+        if warp_idx == 0:
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
+
+        # /////////////////////////////////////////
+        #  Allocate and initialize smem
+        # /////////////////////////////////////////
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         pass
+
+    @staticmethod
+    def _make_tma_atoms_and_tensors(
+        tensor: cute.Tensor,
+        smem_layout_staged: cute.ComposedLayout,
+        # tile shape to perform the copy with.
+        smem_tile: tuple[int, int],
+    ) -> tuple[cute.CopyAtom, cute.Tensor]:
+        """Create TMA atoms and tensors for input tensors"""
+        op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
+
+        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
+        tma_atom, tma_tensor = cute.nvgpu.cpasync.make_tma_tile_atom(
+            op,
+            tensor,
+            smem_layout,
+            smem_tile,
+        )
+        return tma_atom, tma_tensor
+
+
 
     @cute.jit
     def __call__(
@@ -82,6 +123,7 @@ class HopperFusedMultiHeadAttentionForward:
             (s_q, d, ((h_r, h_k), b)),
             stride=(d*h_r*h_k,1,((d * h_k, d)), stride_b_q)
         )
+        q = cute.make_tensor(q_iter, q)
         # dim1: dimension
         # dim2: key group
         # dim3: index in a key group
@@ -91,52 +133,89 @@ class HopperFusedMultiHeadAttentionForward:
             (s_k, d, ((h_r, h_k)), b),
             stride=(d * h_r * h_k, 1, ((0, d)), stride_b_kv)
         )
+        k = cute.make_tensor(k_iter, k)
 
+        # 
+        # 
+        # 
+        # 
+        # 
+        v_layout = cute.make_layout(
+            (d, s_k, ((h_r, h_k), b)),
+            stride=(1, d * h_k, ((0, d), stride_b_kv)),
+        )
+        v = cute.make_tensor(v_iter, v_layout)
+
+        o_layout = cute.make_layout(
+            (s_q, d, ((h_r, h_k), b)),
+            stride=(d * h_r * h_k, 1, ((d * h_k, d), stride_b_q)),
+        )
+        o = cute.make_tensor(o_iter, o_layout)
+        
         # batch stride
         stride_b_qo = h_r * h_k * s_q * d
+
+        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
+        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
+        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
+
 
         # h_r is the number of queries in a group.
 
         # in order to 
-        q = cute.make_tensor(q_iter, q)
 
 
         self.q_dtype = q.element_type
+        self.k_dtype = k.element_type
+        self.v_dtype = v.element_type
+        self.o_dtype = o.element_type
 
-        cta_group = tcgen05.CtaGroup.ONE
         qk_tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.k_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.qk_acc_dtype,
-            cta_group,
+            (1, 1, 1),
             self.mma_tiler[:2],
         )
+        print(qk_tiled_mma)
 
         # Allocate smem
 
         # based on the MMA tiler, make the smem layout for q and k.
-        q_smem_layout_staged = sm90_utils.make_smem_layout_a(
+        self.q_smem_layout_staged = sm90_utils.make_smem_layout_a(
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.q_dtype,
             self.q_stage,
         )
-        k_smem_layout_staged = sm90_utils.make_smem_layout_b(
+        self.k_smem_layout_staged = sm90_utils.make_smem_layout_b(
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.k_dtype,
             self.k_stage,
         )
-        v_smem_layout_staged = sm90_utils.make_smem_layout_b(
+        self.v_smem_layout_staged = sm90_utils.make_smem_layout_b(
             qk_tiled_mma,
             self.qk_mma_tiler,
             self.v_dtype,
             self.kv_stage,
         )
+        self.o_smem_layout_staged = sm90_utils.make_smem_layout_epi(
+            self.o_dtype,
+            self.o_layout,
+            self.epi_tile,
+            self.epi_stage,
+        )
 
-
-
+        self.q_stage = 2
+        self.kv_stage = 4
+        self.acc_stage = 1
+        self.softmax_corr_stage = 1
+        self.mma_corr_stage = 2
+        self.mma_softmax_stage = 1
+        self.epi_stage = 2
 
         @cute.struct
         class SharedStorage:
@@ -170,4 +249,41 @@ class HopperFusedMultiHeadAttentionForward:
             ]
 
         self.shared_storage = SharedStorage
+
+        tma_atom_q, tma_tensor_q = self._make_tma_atoms_and_tensors(
+            q,
+            self.q_smem_layout_staged,
+            (self.qk_mma_tiler[0], self.qk_mma_tiler[2]),
+        )
+
+        tma_atom_k, tma_tensor_k = self._make_tma_atoms_and_tensors(
+            k,
+            self.k_smem_layout_staged,
+            (self.qk_mma_tiler[1], self.qk_mma_tiler[2]),
+        )
+
+        tma_atom_v, tma_tensor_v = self._make_tma_atoms_and_tensors(
+            v,
+            self.v_smem_layout_staged,
+            (self.v_mma_tiler[1], self.v_mma_tiler[2]),
+        )
+
+        tma_atom_o, tma_tensor_o = self._make_tma_atoms_and_tensors(
+            o,
+            self.o_smem_layout_staged,
+            (self.o_mma_tiler[0], self.o_mma_tiler[2]),
+        )
+
+        self.kernel(
+            tma_tensor_q,
+            tma_atom_q,
+            tma_tensor_k,
+            tma_atom_k,
+            tma_tensor_v,
+            tma_atom_v,
+            tma_tensor_o,
+            tma_atom_o,
+        )
+
+
 

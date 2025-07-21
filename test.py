@@ -4,6 +4,7 @@ from flash_attn_3 import HopperFusedMultiHeadAttentionForward
 from torch_harness import *
 import torch
 
+
 def test_flash_attn_3_correctness(
     batch_size: int,
     seq_len: int,
@@ -19,13 +20,7 @@ def test_flash_attn_3_correctness(
         q, k, v, is_causal=True, enable_gqa=True
     )
 
-    flash_attn_3 = HopperFusedMultiHeadAttentionForward(
-        qk_acc_dtype=cutlass.BFloat16,
-        mma_tiler=(1, 1, 1),
-        is_persistent=True,
-    )
-
-    # flash_attn_3_output = flash_attn_3(q, k, v)
+    torch_output = torch_flash_attn_3(q, k, v)
     
     
 
