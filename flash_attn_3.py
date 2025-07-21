@@ -45,9 +45,42 @@ class HopperFusedMultiHeadAttentionForward:
         self.threads_per_cta = self.mma_warp_groups * self.num_threads_per_warp_group
         self.smem_capacity = sm90_utils.SMEM_CAPACITY["sm90"]
 
+        # Warp Specialization IDs
+        self.load_warp_id = 1
+        self.mma_warp_id = 2
+
+
+
+
+
+    def make_and_init_load_q_pipeline(
+        self, 
+        load_q_mbar_ptr: cute.Pointer,
+        cta_layout_vmnk: cute.Layout,
+    ):
+        load_q_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.load_warp_id])
+        )
+        load_q_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, len([self.mma_warp_id])
+        )
+        return pipeline.PipelineTmaAsync.create(
+            num_stages=self.q_stage,
+            producer_group=load_q_producer_group,
+            consumer_group=load_q_consumer_group,
+            tx_count=self.tma_copy_q_bytes,
+            barrier_storage=load_q_mbar_ptr,
+            cta_layout_vmnk=cta_layout_vmnk
+        )
+
+    # def make_
+
+
     @cute.kernel
     def kernel(
         self,
+        qk_tiled_mma: cute.TiledMma,
+        pv_tiled_mma: cute.TiledMma,
         q: cutlass_torch.Tensor,
         tma_atom_q: cute.Atom,
         k: cutlass_torch.Tensor,
@@ -62,6 +95,7 @@ class HopperFusedMultiHeadAttentionForward:
         k_smem_layout_staged: cute.ComposedLayout,
         o_smem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
+        cta_layout_vmnk: cute.Layout,
     ):
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -82,31 +116,95 @@ class HopperFusedMultiHeadAttentionForward:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
+        load_q_pipeline = self.make_and_init_load_q_pipeline(
+            storage.load_q_mbar_ptr.data_ptr(),
+            cta_layout_vmnk
+        )
+
         # ///////////////////////////////
         #  Allocate and initialize smem
         # ///////////////////////////////
 
-        sQ = storage.sQ.get_tensor(
+        sQ: cute.Tensor = storage.sQ.get_tensor(
             q_smem_layout_staged.outer, swizzle=q_smem_layout_staged.inner
         )
-        sK = storage.sK.get_tensor(
+        sK: cute.Tensor = storage.sK.get_tensor(
             k_smem_layout_staged.outer, swizzle=k_smem_layout_staged.inner
         )
-        sV_ptr = cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner)
-        sV = cute.make_tensor(sV_ptr, v_smem_layout_staged.outer)
+        sV_ptr: cute.Pointer = cute.recast_ptr(sK.iterator, v_smem_layout_staged.inner)
+        sV: cute.Tensor = cute.make_tensor(sV_ptr, v_smem_layout_staged.outer)
 
-        sO = storage.sO.get_tensor(
+        sO: cute.Tensor = storage.sO.get_tensor(
             o_smem_layout_staged.outer, swizzle=o_smem_layout_staged.inner
         )
 
-        tSrQ = qk_thr_mma.make_fragment_A(sQ)
-        tSrK = qk_thr_mma.make_fragment_B(sK)
-        tOrV = pv_thr_mma.make_fragment_B(sV)
+        tidx, _, _ = cute.arch.thread_idx()
+
+        warp_group_idx = cute.arch.make_warp_uniform(
+            tidx // self.num_threads_per_warp_group
+        )
+        warp_group_thread_layout = cute.make_layout(
+            self.mma_warp_groups, stride=self.num_threads_per_warp_group
+        )
+        qk_thr_mma = qk_tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
+        pv_thr_mma = pv_tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx))
+        # qk_thr_mma = qk_tiled_mma.get_slice(0)  # default 1sm
+
+        print("qk_thr_mma", qk_thr_mma)
+
+        tSrQ = qk_thr_mma.partition_A(sQ)
+        tSrK = qk_thr_mma.partition_B(sK)
+        tOrV = pv_thr_mma.partition_B(sV)
+
+        print("tSrQ", tSrQ)
+        print("tSrK", tSrK)
+        print("tOrV", tOrV)
+
+        tCsQ = qk_thr_mma.partition_A(sQ)
+        tCsK = qk_thr_mma.partition_B(sK)
+        tCsV = pv_thr_mma.partition_B(sV)
+
+        # I don't even know what these are.
+        # I believe that these are TMA descriptors.
+        tCrQ = qk_tiled_mma.make_fragment_A(tCsQ)
+        tCrK = qk_tiled_mma.make_fragment_B(tCsK)
+        tCrV = pv_tiled_mma.make_fragment_B(tCsV)
+
+        print("tCsQ", tCsQ)
+        print("tCsK", tCsK)
+        print("tCsV", tCsV)
+        print("tCrQ", tCrQ)
+        print("tCrK", tCrK)
+        print("tCrV", tCrV)
+
+        qk_acc_shape = qk_thr_mma.partition_shape_C(
+            (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+        )
+        tStS = qk_thr_mma.make_fragment_C(qk_acc_shape)
+
+        pv_acc_shape = pv_thr_mma.partition_shape_C(
+            (self.pv_mma_tiler[0], self.pv_mma_tiler[1])
+        )
+        tStS0 = cute.make_tensor(tStS.iterator, tStS.layout)
+        tStS1 = cute.make_tensor(tStS.iterator, tStS.layout)
+
+        print("tStS0", tStS0)
+        print("tStS1", tStS1)
 
 
 
 
-        
+
+
+
+
+
+
+
+        # qk_acc_shape = qk_thr_mma.partition_shape_C(
+        #     (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+        # )
+        # print("qk_acc_shape", qk_acc_shape)
 
     @staticmethod
     def _make_tma_atoms_and_tensors(
@@ -375,9 +473,20 @@ class HopperFusedMultiHeadAttentionForward:
         
         self.threads_per_cta = 1024
 
+        q_smem_layout = cute.select(self.q_smem_layout_staged, mode=[0, 1, 2])
+        k_smem_layout = cute.select(self.k_smem_layout_staged, mode=[0, 1, 2])
+
+        q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
+        k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
+        self.tma_copy_q_bytes = q_copy_size
+        self.tma_copy_kv_bytes = k_copy_size
+        
+        self.cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
 
         # grid = self._compute_grid(c, self.tile_shape_mnk, self.cluster_shape_mnk)
         self.kernel(
+            qk_tiled_mma,
+            pv_tiled_mma,
             tma_tensor_q,
             tma_atom_q,
             tma_tensor_k,
@@ -392,6 +501,7 @@ class HopperFusedMultiHeadAttentionForward:
             self.k_smem_layout_staged,
             self.o_smem_layout_staged,
             self.v_smem_layout_staged,
+            self.cta_layout_vmnk,
         ).launch(
             # grid=grid,
             grid = [1, 1, 1],
