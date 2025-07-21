@@ -15,14 +15,11 @@ def test_flash_attn_3_correctness(
     q = torch.randn(batch_size, seq_len, num_q_heads, head_dim, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(batch_size, seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
     v = torch.randn(batch_size, seq_len, num_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
-
     reference_output = torch.nn.functional.scaled_dot_product_attention(
         q, k, v, is_causal=True, enable_gqa=True
     )
-
-    torch_output = torch_flash_attn_3(q, k, v)
-    
-    
+    cute_output = torch_flash_attn_3(q, k, v)
+    assert torch.allclose(reference_output, cute_output, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":
