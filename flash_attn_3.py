@@ -58,12 +58,8 @@ class HopperFusedMultiHeadAttentionForward:
         load_q_mbar_ptr: cute.Pointer,
         cta_layout_vmnk: cute.Layout,
     ):
-        load_q_producer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.load_warp_id])
-        )
-        load_q_consumer_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, len([self.mma_warp_id])
-        )
+        load_q_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        load_q_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         return pipeline.PipelineTmaAsync.create(
             num_stages=self.q_stage,
             producer_group=load_q_producer_group,
@@ -164,18 +160,12 @@ class HopperFusedMultiHeadAttentionForward:
         tCsK = qk_thr_mma.partition_B(sK)
         tCsV = pv_thr_mma.partition_B(sV)
 
-        # I don't even know what these are.
-        # I believe that these are TMA descriptors.
         tCrQ = qk_tiled_mma.make_fragment_A(tCsQ)
         tCrK = qk_tiled_mma.make_fragment_B(tCsK)
         tCrV = pv_tiled_mma.make_fragment_B(tCsV)
 
-        print("tCsQ", tCsQ)
-        print("tCsK", tCsK)
-        print("tCsV", tCsV)
-        print("tCrQ", tCrQ)
-        print("tCrK", tCrK)
-        print("tCrV", tCrV)
+        # CuTe library for abstracting away important parts
+        # of the system.
 
         qk_acc_shape = qk_thr_mma.partition_shape_C(
             (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
@@ -188,23 +178,39 @@ class HopperFusedMultiHeadAttentionForward:
         tStS0 = cute.make_tensor(tStS.iterator, tStS.layout)
         tStS1 = cute.make_tensor(tStS.iterator, tStS.layout)
 
-        print("tStS0", tStS0)
-        print("tStS1", tStS1)
+        # ///////////////////////////////
+        # Tile Global Tensors
+        # ///////////////////////////////
+        
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
+        
+        # q: (b, s_q, h_q, d)
+        tile_coord_mnkl = (bidx, bidy, None, bidz)
+        # how would you do this? I would load each 
 
+        gQ = cute.local_tile(
+            q.iterator, 
+            qk_tiled_mma, # TODO: please replace this with CTA tiler, do not just use the qk_tiled_mma to 
+        )
 
-
-
-
-
-
-
-
-
-
-        # qk_acc_shape = qk_thr_mma.partition_shape_C(
-        #     (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+        # ///////////////////////////////
+        # Prefetch Q & K + V
+        # ///////////////////////////////
+        q_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.q_stage
+        )
+        kv_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.kv_stage
+        )
+        # ///////////////////////////////
+        # k_tile_cnt = cute.size(gA_mkl, mode=[2])
+        # prefetch_k_tile_cnt = cutlass.max(cutlass.min(self.ab_stage, k_tile_cnt), 0)
+        # q_producer_state = pipeline.make_pipeline_state(
+        #     pipeline.PipelineUserType.Producer, self.q_stage
         # )
-        # print("qk_acc_shape", qk_acc_shape)
+        # if warp_idx == 0:
+        #     for prefetch_idx in cutlass.range(prefetch_k_tile_cnt, unroll=1):
 
     @staticmethod
     def _make_tma_atoms_and_tensors(
@@ -480,7 +486,7 @@ class HopperFusedMultiHeadAttentionForward:
         k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
         self.tma_copy_q_bytes = q_copy_size
         self.tma_copy_kv_bytes = k_copy_size
-        
+
         self.cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
 
         # grid = self._compute_grid(c, self.tile_shape_mnk, self.cluster_shape_mnk)
@@ -510,6 +516,33 @@ class HopperFusedMultiHeadAttentionForward:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
         )
+
+    def load(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        sQ: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        tma_atom_Q: cute.CopyAtom,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        pipeline_k: cutlass.utils.pipeline.PipelineAsync,
+        pipeline_v: cutlass.utils.pipeline.PipelineAsync,
+        mbar_ptr_Q: cutlass.Pointer,
+        block_info: BlockInfo,
+    ):
+        pass
+    
+    # for the mma parts to perform.
+    def mma(
+        self,
+    ):
+        pass
+
+
+
 
 
 
