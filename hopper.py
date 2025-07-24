@@ -765,6 +765,8 @@ class HopperWgmmaGemmKernel:
             pipeline.PipelineUserType.Consumer, self.ab_stage
         )
 
+        tiled_mma.make_epilogue_atom()
+
         peek_ab_full_status = cutlass.Boolean(1)
         if mainloop_consumer_read_state.count < k_tile_cnt:
             peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
@@ -949,7 +951,6 @@ class HopperWgmmaGemmKernel:
 
         sepi_for_tma_partition = cute.group_modes(sc, 0, 2)
         tcgc_for_tma_partition = cute.zipped_divide(gC_mnl, self.epi_tile)
-
         bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
             tma_atom_c,
             0,
@@ -968,8 +969,7 @@ class HopperWgmmaGemmKernel:
 
             # Type conversion
             tRS_rD_out = cute.make_fragment_like(tRS_rD_layout, self.c_dtype)
-            acc_vec = tRS_rD.load()
-            tRS_rD_out.store(acc_vec.to(self.c_dtype))
+            tRS_rD_out.store(tRS_rD.load().to(self.c_dtype))
 
             # Copy from D registers to shared memory
             epi_buffer = epi_idx % cute.size(tRS_sD, mode=[3])
