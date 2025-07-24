@@ -634,6 +634,10 @@ class HopperWgmmaGemmKernel:
         gC_mnl = cute.local_tile(
             mC_mnl, self.tile_shape_mnk, tile_coord_mnkl, proj=(1, 1, None)
         )
+        print("sA", sa)
+        print("gA_mkl", gA_mkl)
+        print("gB_nkl", gB_nkl)
+        print("gC_mnl", gC_mnl)
 
         # //////////////////////////////////////////////////////////////////////////////
         #  Partition global tensor for TiledMMA_A/B/C
@@ -786,6 +790,9 @@ class HopperWgmmaGemmKernel:
                 tCrA_1phase = tCrA[k_block_coord]
                 tCrB_1phase = tCrB[k_block_coord]
 
+                print("tCrA_1phase", tCrA_1phase)
+                print("tCrB_1phase", tCrB_1phase)
+                print("accumulators", accumulators)
                 cute.gemm(
                     tiled_mma,
                     accumulators,
@@ -794,6 +801,19 @@ class HopperWgmmaGemmKernel:
                     accumulators,
                 )
                 tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+
+            # projects
+            # Self-forcing
+
+            # Performance Engineering Kernels
+            # First kernels written in CuTe. Went from knowing nothing about kernels to matching
+            # top performance of existing kernels + new kernels that are faster than existing kernels within 2 weeks.
+            # - Repos: cuteFlashAttention3 -- matches top performance of FA3
+            # - Repos: cuteFlashMLA -- matches top performance of FlashMLA
+            # - Repos: cuteFlashNSA -- fastest existing NSA implementation
+
+            # Jolt: Zero-bloat Reinforcement Learning stack
+            # - A simple, hackable RL stack with multi-turn support.
 
             cute.nvgpu.warpgroup.commit_group()
             mainloop_consumer_read_state.advance()
@@ -913,21 +933,7 @@ class HopperWgmmaGemmKernel:
             elem_ty_d=self.c_dtype,
             elem_ty_acc=self.acc_dtype,
         )
-
-        copy_atom_C = cute.make_copy_atom(
-            cute.nvgpu.warp.StMatrix8x8x16bOp(
-                self.c_layout.is_m_major_c(),
-                4,
-            ),
-            self.c_dtype,
-        )
-
-        tiled_copy_C_Atom = cute.make_tiled_copy_C_atom(copy_atom_C, tiled_mma)
-
-        tiled_copy_r2s = cute.make_tiled_copy_S(
-            copy_atom_r2s,
-            tiled_copy_C_Atom,
-        )
+        tiled_copy_r2s = cute.make_tiled_copy_C_atom(copy_atom_r2s, tiled_mma)
 
         # (R2S, R2S_M, R2S_N, PIPE_D)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
@@ -1427,9 +1433,9 @@ def run_dense_gemm(
 
         return f32_torch_tensor, cute_tensor, torch_tensor
 
-    a, mA, a_torch = create_and_permute_tensor(l, m, k, a_major == "m", a_dtype)
-    b, mB, b_torch = create_and_permute_tensor(l, n, k, b_major == "n", b_dtype)
-    c, mC, c_torch = create_and_permute_tensor(l, m, n, c_major == "m", c_dtype)
+    a, mA, a_torch = create_and_permute_tensor(l, m, k, a_major == "m", a_dtype, is_dynamic_layout=False)
+    b, mB, b_torch = create_and_permute_tensor(l, n, k, b_major == "n", b_dtype, is_dynamic_layout=False)
+    c, mC, c_torch = create_and_permute_tensor(l, m, n, c_major == "m", c_dtype, is_dynamic_layout=False)
 
     gemm = HopperWgmmaGemmKernel(acc_dtype, tile_shape_mnk, cluster_shape_mnk)
 
