@@ -298,7 +298,6 @@ class Gemm:
 
         # 3. tiled mma
         mm = cute.nvgpu.warpgroup.OperandMajorMode.K
-
         self.atom_layout_mnk = (1, 1, 1)
         self.acc_dtype = cutlass.Float32
         tiled_mma = sm90_utils.make_trivial_tiled_mma(
@@ -310,7 +309,6 @@ class Gemm:
             self.atom_layout_mnk,
             tiler_mn=(self.cta_tile[0], self.cta_tile[1]),
         )
-
 
         @cute.struct
         class SharedStorage:

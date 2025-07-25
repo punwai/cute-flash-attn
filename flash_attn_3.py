@@ -50,9 +50,6 @@ class HopperFusedMultiHeadAttentionForward:
         self.mma_warp_id = 2
 
 
-
-
-
     def make_and_init_load_q_pipeline(
         self, 
         load_q_mbar_ptr: cute.Pointer,
@@ -155,6 +152,8 @@ class HopperFusedMultiHeadAttentionForward:
         print("tSrQ", tSrQ)
         print("tSrK", tSrK)
         print("tOrV", tOrV)
+
+        cute.print_tensor(tSrQ)
 
         tCsQ = qk_thr_mma.partition_A(sQ)
         tCsK = qk_thr_mma.partition_B(sK)
