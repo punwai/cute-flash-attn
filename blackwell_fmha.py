@@ -953,6 +953,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2])
                     )
                     tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
+
+                    
                     tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_q,
                         0,  # no multicast
@@ -991,6 +993,29 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # Q0
                     q0_coord = 2 * curr_block_coord_q[0]
                     load_q_pipeline.producer_acquire(q_producer_state)
+
+                    cluster_shape_mnk = (1, 1, 1)
+                    cta_layout = cute.make_layout(cluster_shape_mnk)
+                    cta_layout = cute.make_layout(cute.slice_(cta_layout, (0, None, 0)).shape)
+                    cta_crd = (0,)
+
+                    tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_q,
+                        cta_crd,
+                        cta_layout,
+                        cute.group_modes(sQ, 0, 2),
+                        cute.group_modes(tQsQ, 0, 2),
+                    )
+
+                    tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_k,
+                        cta_crd,
+                        cta_layout,
+                        cute.group_modes(sK, 0, 2),
+                        cute.group_modes(tKgK, 0, 2),
+                    )
+
+
                     cute.copy(
                         tma_atom_q,
                         tQgQ[None, q0_coord],
@@ -2132,7 +2157,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         seqlen_k_,
                         row_max,
                         row_sum,
-                        mma_si_consumer_state,
+                        mma_siconsumer_state,
                         si_corr_producer_state,
                         s0_s1_sequence_state,
                         mma_si_pipeline,
@@ -2605,6 +2630,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cta_tiler: Tuple[int, int, int],
         is_persistent: bool,
     ) -> Tuple[FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
+        # s, d, ((h_r, h_k), b)
         tile_sched_params = create_fmha_static_tile_scheduler_params(
             is_persistent,
             (

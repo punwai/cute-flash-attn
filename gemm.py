@@ -132,6 +132,7 @@ class Gemm:
             for _ in cutlass.range(k_tile_cnt, unroll=1):
                 # what acquire does is to signal that you are readying this barrier up for the TMA.
                 mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                print("tAgA_mkl.shape", tAgA_mkl.shape)
                 tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
                 tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
                 tBgB_k = tBgB_nkl[(None, mainloop_producer_state.count)]
