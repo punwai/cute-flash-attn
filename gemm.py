@@ -197,9 +197,6 @@ class Gemm:
             tRS_sD = thr_copy_r2s.partition_D(sC)
             tRS_rAcc = tiled_copy_r2s.retile(accumulators)
 
-            print("tRS_sD", tRS_sD)
-            print("tRS_rAcc", accumulators)
-
             # 1b. reformat the partition shape to match a shape that can be used in the cute.copy
             # despite the best of my efforts, i cannot figure out a way to use the existing accumulator
             # shapes with the shared tensor shape. so, we're going to make a new fragment that we know
@@ -207,7 +204,6 @@ class Gemm:
             rD_shape = cute.shape(thr_copy_r2s.partition_S(sC))
             tRS_rD_layout = cute.make_layout(rD_shape[:3])
             tRS_rD = cute.make_fragment_like(tRS_rD_layout, self.c_dtype)
-
 
             for i in range(cute.size(tRS_rD)):
                 tRS_rD[i] = accumulators[i]

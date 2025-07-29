@@ -838,6 +838,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         tOtO = pv_thr_mma.make_fragment_C(pv_acc_shape)
 
+        # i don't quite understand this.
         tStS0 = cute.make_tensor(tStS.iterator + self.tmem_s0_offset, tStS.layout)
         tStS1 = cute.make_tensor(tStS.iterator + self.tmem_s1_offset, tStS.layout)
 
@@ -994,11 +995,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     q0_coord = 2 * curr_block_coord_q[0]
                     load_q_pipeline.producer_acquire(q_producer_state)
 
-                    cluster_shape_mnk = (1, 1, 1)
-                    cta_layout = cute.make_layout(cluster_shape_mnk)
-                    cta_layout = cute.make_layout(cute.slice_(cta_layout, (0, None, 0)).shape)
-                    cta_crd = (0,)
-
+                    cta_layout = 
                     tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_q,
                         cta_crd,
@@ -1006,13 +1003,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.group_modes(sQ, 0, 2),
                         cute.group_modes(tQsQ, 0, 2),
                     )
-
-                    tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_k,
+                    tBsB, tBgB_nkl = cute.nvgpu.cpasync.tma_partition(
+                        b_tma_atom,
                         cta_crd,
                         cta_layout,
-                        cute.group_modes(sK, 0, 2),
-                        cute.group_modes(tKgK, 0, 2),
+                        cute.group_modes(sB, 0, 2),
+                        cute.group_modes(gB, 0, 2),
                     )
 
 

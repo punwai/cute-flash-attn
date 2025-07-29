@@ -6,15 +6,16 @@
 # you know the playbook. just isolate the component, make minimal tests, play around with it.
 # imagine how you used to learn python when you were 10 years old. execution feedback, isolated environments
 # understand how things work deeply, and what is going on.
-
 # although benchmarking might take longer, you should be able to do the bulk of the kernel work in 1 day.
 # this is not a problem, and there is basically a playbook for every single section.
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu.warpgroup import OperandSource
 import cutlass.torch as cutlass_torch
 import cutlass.pipeline as pipeline
 import torch
+import math
 import cuda.bindings.driver as cuda
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
@@ -27,7 +28,7 @@ def transpose(tensor: cutlass.Tensor, new_indices: List[int]):
 
 
 # H100 kernel for Flash Attention 3
-class HopperFA3:
+class HopperFA2:
     def __init__(
         self,
         cta_tile: Tuple[int, int, int],
@@ -115,6 +116,8 @@ class HopperFA3:
                 cute.struct.MemRange[self.v_dtype, cute.cosize(self.v_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            mi_ptr: cute.struct.MemRange[cutlass.Int32, self.cta_tile[0]]
+            li_ptr: cute.struct.MemRange[cutlass.Int32, self.cta_tile[0]]
             q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             kv_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.kv_pipeline_stages * 2]
 
@@ -126,7 +129,7 @@ class HopperFA3:
         mm = cute.nvgpu.warpgroup.OperandMajorMode.K
         self.atom_layout_mnk = (1, 1, 1)
         self.acc_dtype = cutlass.Float32
-        self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
+        self.tiled_mma_qk = sm90_utils.make_trivial_tiled_mma(
             self.q_dtype,
             self.k_dtype,
             mm,
@@ -134,6 +137,17 @@ class HopperFA3:
             self.acc_dtype,
             self.atom_layout_mnk,
             tiler_mn=(self.cta_tile[0], self.cta_tile[1]),
+        )
+
+        self.tiled_mma_v = sm90_utils.make_trivial_tiled_mma(
+            self.q_dtype,
+            self.v_dtype,
+            mm,
+            mm,
+            self.acc_dtype,
+            self.atom_layout_mnk,
+            tiler_mn=(self.cta_tile[1], self.cta_tile[2]),
+            a_source=OperandSource.RMEM,
         )
 
         self.kernel(
@@ -146,7 +160,8 @@ class HopperFA3:
             q_tma_atom,
             k_tma_atom,
             v_tma_atom,
-            self.tiled_mma,
+            self.tiled_mma_qk,
+            self.tiled_mma_v,
         ).launch(
             grid=[1, 1, 1],
             block=[256, 1, 1],
@@ -167,7 +182,8 @@ class HopperFA3:
         q_tma_atom: cute.Atom,
         k_tma_atom: cute.Atom,
         v_tma_atom: cute.Atom,
-        tiled_mma: cute.TiledMma,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_v: cute.TiledMma,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
@@ -288,19 +304,33 @@ class HopperFA3:
                 load_kv_pipeline_state.advance()
 
 
-        qk_thr_mma = tiled_mma.get_slice(0)
+        qk_thr_mma = tiled_mma_qk.get_slice(tidx)
         tCsK = qk_thr_mma.partition_A(sK)
         tCsQ = qk_thr_mma.partition_B(sQ)
-        tCrK = tiled_mma.make_fragment_A(tCsK)
-        tCrQ = tiled_mma.make_fragment_B(tCsQ)
-
+        tCrK = tiled_mma_qk.make_fragment_A(tCsK)
+        tCrQ = tiled_mma_qk.make_fragment_B(tCsQ)
         qk_acc_shape = qk_thr_mma.partition_shape_C(
             (self.cta_tile[0], self.cta_tile[1])
         )
-        accumulators = cute.make_fragment(qk_acc_shape, self.acc_dtype)
+        tStS = cute.make_fragment(qk_acc_shape, self.acc_dtype)
 
+        # note that we only properly partition B and C.
+        # for A, we will just re-format the output later on.
+        v_thr_mma = tiled_mma_v.get_slice(tidx)
+        tCsV = v_thr_mma.partition_B(sV)
 
-        # # run
+        tCrV = tiled_mma_v.make_fragment_B(tCsV)
+
+        o_acc_shape = v_thr_mma.partition_shape_C(
+            (self.cta_tile[1], self.cta_tile[2])
+        )
+        v_A_shape = v_thr_mma.partition_shape_A(
+            (self.cta_tile[0], self.cta_tile[1])
+        )
+        tStO = cute.make_fragment(o_acc_shape, self.acc_dtype)
+        tOtO = cute.make_fragment(o_acc_shape, self.acc_dtype)
+
+        #
         if is_consumer_warp:
             # run mma
             mma_kv_pipeline_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_pipeline_stages)
@@ -308,25 +338,96 @@ class HopperFA3:
             load_q_pipeline.consumer_wait(mma_q_pipeline_state)
             load_q_pipeline.consumer_release(mma_q_pipeline_state)
 
+            # each thread contains the accumulator outputs from 2 separate accumulators.
+            # we need two register accumulators to store the running max and sum for each of the rows.
+
+            # number of rows in tStS. (this is equivalent to 2 in Hopper)
+            old_row_max = cute.make_fragment((tStS.shape[0][0],), cutlass.Float32)
+            old_row_max.fill(-cutlass.Float32.inf)
+            running_sum = cute.make_fragment((tStS.shape[0][0],), cutlass.Float32)
+            running_sum.fill(0.0)
+
             for k_block in cutlass.range(num_kv_blocks, unroll=1):
                 load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
 
-                num_k_microtiles = cute.size(gK_local, mode=[2])
+                num_k_microtiles = cute.size(tCrK, mode=[2])
+
+                tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
                 for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
+                    q_block_coord = (None, None, k_microtile_ix, 0)
                     k_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
                     cute.gemm(
-                        tiled_mma,
-                        accumulators,
+                        tiled_mma_qk,
+                        tStS,
                         tCrK[k_block_coord],
-                        tCrQ[k_block_coord],
-                        accumulators,
+                        tCrQ[q_block_coord],
+                        tStS,
                     )
-                    if k_block == 0 and k_microtile_ix == 0:
-                        tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                    if k_microtile_ix == 0:
+                        tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
 
-                load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
+                # use a composition to get the desired matrices that you want.
+
+                new_row_max = cute.make_fragment_like(old_row_max, cutlass.Float32)
+                new_row_sum = cute.make_fragment_like(running_sum, cutlass.Float32)
+                scaling_factor = cute.make_fragment_like(running_sum, cutlass.Float32)
+
+                log2_e = math.log2(math.e)
+                for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0])):
+                    row_tensor = tStS[(None, i, None), 0, 0]
+                    row_ssa = row_tensor.load()
+                    row_max = row_ssa.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
+                    for i in cutlass.range_constexpr(2):
+                        row_max = cutlass.max(row_max, cute.arch.shuffle_sync_bfly(row_max, 1 << i))
+
+                    new_row_max[i] = cutlass.max(old_row_max[i], row_max)
+
+                    row_p = cute.exp2((row_ssa - new_row_max[i]) * log2_e)
+                    row_tensor.store(row_p)
+
+                    row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, 0)
+                    for i in cutlass.range_constexpr(2):
+                        row_sum += cute.arch.shuffle_sync_bfly(row_sum, 1 << i)
+
+                    scaling_factor[i] = cute.arch.exp2((new_row_max[i] - old_row_max[i]) * log2_e)
+                    new_row_sum[i] = row_sum
+                    running_sum[i] = scaling_factor[i] * running_sum[i] + new_row_sum[i]
+
+                    # output
+                    tStO.store(tStO.load() / scaling_factor[i])
+
+                old_row_max = new_row_max
+
+                tPtP_fp32 = tStS
+                tPtP = cute.make_fragment(tPtP_fp32.layout, self.k_dtype)
+                tPtP.store(tPtP_fp32.load().to(self.k_dtype))
+
+                # # we re-format the tPtP we have into the shape that we need.
+                p_A_layout = cute.make_layout(v_A_shape)
+                p_A_tensor = cute.make_tensor(tPtP.iterator, p_A_layout)
+
+                # output scaling
+                num_k_microtiles = cute.size(p_A_tensor, mode=[2])
+                for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
+                    p_block_coord = (None, None, k_microtile_ix)
+                    v_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
+                    cute.gemm(
+                        tiled_mma_v,
+                        tStO,
+                        p_A_tensor[p_block_coord],
+                        tCrV[v_block_coord],
+                        tStO,
+                    )
+                    tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+
+                # output scaling
                 mma_kv_pipeline_state.advance()
+                load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
 
+            # write back the tile to global memory.
+            for i in cutlass.range_constexpr(cute.size(tStO, mode=[0])):
+                tStO_row = tStO[(None, i, None), 0, 0]
+                tStO_row.store(tStO_row.load() / running_sum[i])
 
 
 
@@ -352,7 +453,7 @@ if __name__ == "__main__":
 
     stream = cuda.CUstream()
 
-    hopper_fa = HopperFA3(cta_tile=(64, 64, 128))
+    hopper_fa = HopperFA2(cta_tile=(64, 64, 128))
     compiled_kernel = cute.compile(hopper_fa, q, k, v, o, stream)
     compiled_kernel(q, k, v, o, stream)
     
