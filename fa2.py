@@ -429,8 +429,6 @@ class HopperFA2:
                 tStO_row = tStO[(None, i, None), 0, 0]
                 tStO_row.store(tStO_row.load() / running_sum[i])
 
-
-
 if __name__ == "__main__":
 
     head_dims = 128
