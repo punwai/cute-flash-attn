@@ -44,11 +44,10 @@ class HopperFA2:
         o: cutlass.Tensor, # (B, H_qo, S_qo, D) [DANGER: transpose later on]
         stream: cuda.CUstream,
     ):
-        q = transpose(q, [2, 3, 1, 0]) # (S_qo, D, H_qo, B)
-        k = transpose(k, [2, 3, 1, 0]) # (S_kv, D, H_kv, B)
-        v = transpose(v, [3, 2, 1, 0]) # (D, S_kv, H_kv, B)
-        o = transpose(o, [2, 3, 1, 0]) # (S_qo, D, H_qo, B)
-
+        q = transpose(q, [2, 3, 1, 0]) # (S_qo, D, H, B)
+        k = transpose(k, [2, 3, 1, 0]) # (S_kv, D, H, B)
+        v = transpose(v, [3, 2, 1, 0]) # (D, S_kv, H, B)
+        o = transpose(o, [2, 3, 1, 0]) # (S_qo, D, H, B)
 
         q_smem_shape = o_smem_shape = (self.cta_tile[0], self.cta_tile[2])
         k_smem_shape = (self.cta_tile[1], self.cta_tile[2])
@@ -164,6 +163,12 @@ class HopperFA2:
             a_source=OperandSource.RMEM,
         )
 
+        # num q blocks
+        num_q_blocks = cute.size(cute.tiled_divide(q, (self.cta_tile[0], self.cta_tile[2])), mode=[1])
+        # num kv blocks
+        num_heads = cute.size(q, mode=[2])
+        num_batches = cute.size(q, mode=[3])
+
         self.kernel(
             q_tma_tensor,
             k_tma_tensor,
@@ -180,7 +185,7 @@ class HopperFA2:
             self.tiled_mma_qk,
             self.tiled_mma_v,
         ).launch(
-            grid=[1, 1, 1],
+            grid=[num_q_blocks, num_heads, num_batches],
             block=[256, 1, 1],
             cluster=[1, 1, 1],
             smem=self.shared_storage.size_in_bytes(),
@@ -257,9 +262,12 @@ class HopperFA2:
         gQ_tiled = cute.flat_divide(gQ, (self.cta_tile[0], self.cta_tile[2])) # (S_qo, D, H_qo, B)
         gK_tiled = cute.flat_divide(gK, (self.cta_tile[1], self.cta_tile[2])) # (S_kv, D, H_kv, B)
         gV_tiled = cute.flat_divide(gV, (self.cta_tile[2], self.cta_tile[1])) # (S_kv, D, H_kv, B)
+        gO_tiled = cute.flat_divide(gO, (self.cta_tile[0], self.cta_tile[2])) # (S_qo, D, H_qo, B)
+
         gQ_local = gQ_tiled[*(None, None), *(bidx, None, bidy, bidz)] # (tile_M, tile_N, 1)
         gK_local = gK_tiled[*(None, None), *(None, 0, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
         gV_local = gV_tiled[*(None, None), *(None, 0, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
+        gO_local = gO_tiled[*(None, None), *(bidx, None, bidy, bidz)] # (tile_M, tile_N, 1)
 
         # load q into memory.
         is_producer_warp = warp_idx in [self.load_warp_id]
@@ -491,13 +499,9 @@ class HopperFA2:
             )
             cute.arch.barrier()
 
-            if tidx % 128 == 0:
-                cute.printf("sO")
-                cute.print_tensor(sO)
-
             # # perform the smem -> gmem copy.
             sepi_for_tma_partition = cute.group_modes(sO, 0, 2)
-            tcgc_for_tma_partition = cute.zipped_divide(gO, cute.slice_(self.cta_tile, (None, 0, None)))
+            tcgc_for_tma_partition = cute.zipped_divide(gO_local, cute.slice_(self.cta_tile, (None, 0, None)))
             bSG_sD, bSG_gD = cute.nvgpu.cpasync.tma_partition(
                 o_tma_atom,
                 0,
@@ -505,9 +509,6 @@ class HopperFA2:
                 sepi_for_tma_partition,
                 tcgc_for_tma_partition,
             )
-
-            print("bSG_sD.shape", bSG_sD.shape)
-            print("bSG_gD.shape", bSG_gD.shape)
 
             cute.copy(
                 o_tma_atom,
@@ -517,12 +518,11 @@ class HopperFA2:
 
 if __name__ == "__main__":
     head_dims = 64
-    batch_size = 3
-    num_key_heads = 4
-    group_size = 1
+    batch_size = 1
+    num_key_heads = 1
     qo_seq_len = 128
     kv_seq_len = 128
-    B, S_qo, S_kv, H_kv, H_qo, D = batch_size, qo_seq_len, kv_seq_len, num_key_heads, num_key_heads * group_size, head_dims
+    B, S_qo, S_kv, H_kv, H_qo, D = batch_size, qo_seq_len, kv_seq_len, num_key_heads, num_key_heads, head_dims
 
     q_torch = torch.ones(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
     for i in range(S_qo):
