@@ -378,14 +378,12 @@ class HopperFA2:
             running_sum = cute.make_fragment_like(old_row_max, cutlass.Float32)
             running_sum.fill(0.0)
 
-
             for k_block in cutlass.range(num_kv_blocks, unroll=1):
                 load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
                 num_k_microtiles = cute.size(tCrK, mode=[2])
-                
+
                 # M * K = (64, 64)
                 # N * K = (64, 128)
-
                 tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
                 cute.nvgpu.warpgroup.fence()
                 for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
@@ -403,8 +401,7 @@ class HopperFA2:
                 cute.nvgpu.warpgroup.fence()
 
                 # divide tStS by \sqrt{D}
-                tStS_scaled = cute.make_fragment(tStS.layout, cutlass.Float32)
-                tStS_scaled.store(tStS.load().to(cutlass.Float32) / math.sqrt(cute.size(gQ, mode=[1])))
+                tStS.store(tStS.load().to(cutlass.Float32) / math.sqrt(cute.size(gQ, mode=[1])))
 
                 # use a composition to get the desired matrices that you want.
                 new_row_max = cute.make_fragment_like(old_row_max, cutlass.Float32)
@@ -486,8 +483,6 @@ class HopperFA2:
             tStO_fp16 = cute.make_fragment(tStO.layout, self.o_dtype)
             tStO_fp16.store(tStO.load().to(self.o_dtype))
 
-            tRS_rAcc = tiled_copy_r2s.retile(tStO_fp16)
-
             rD_shape = cute.shape(thr_copy_r2s.partition_S(sO))
             tRS_rD_layout = cute.make_layout(rD_shape[:3])
             tRS_rD = cute.make_fragment_like(tRS_rD_layout, self.o_dtype)
@@ -524,20 +519,14 @@ if __name__ == "__main__":
     head_dims = 64
     batch_size = 1
     num_key_heads = 1
-    qo_seq_len = 128
-    kv_seq_len = 128
+    qo_seq_len = 64
+    kv_seq_len = 64
+
     B, S_qo, S_kv, H_kv, H_qo, D = batch_size, qo_seq_len, kv_seq_len, num_key_heads, num_key_heads, head_dims
 
-    q_torch = torch.ones(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
-    for i in range(S_qo):
-        q_torch[:, :, i, :] = q_torch[:, :, i, :] * (i + 1)
-
-    k_torch = torch.ones(B, H_kv, S_kv, D, dtype=torch.float16, device="cuda")
-
-    v_torch = torch.ones(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
-    for i in range(D):
-        v_torch[:, :, :, i] = v_torch[:, :, :, i] * (i + 1)
-
+    q_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
+    k_torch = torch.randn(B, H_kv, S_kv, D, dtype=torch.float16, device="cuda")
+    v_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
     o_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
 
     q = cutlass_torch.from_dlpack(q_torch, assumed_align=16)
@@ -547,19 +536,25 @@ if __name__ == "__main__":
 
     stream = cuda.CUstream()
 
+    # compute the output of the kernel
     hopper_fa = HopperFA2(cta_tile=(64, 64, 64))
     compiled_kernel = cute.compile(hopper_fa, q, k, v, o, stream)
     compiled_kernel(q, k, v, o, stream)
 
-    o_np = o_torch.cpu().numpy()
-    o_reshaped = o_np.reshape(-1, D)
-    with open('output_tensor.csv', 'w', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        header = [f'dim_{i}' for i in range(D)]
-        writer.writerow(header)
-        for row in o_reshaped:
-            writer.writerow(row.tolist())
+    o_torch_ref = torch.nn.functional.scaled_dot_product_attention(q_torch, k_torch, v_torch, scale=1.0 / math.sqrt(D))
 
-    print(f"Output tensor written to output_tensor.csv")
-    print(f"Shape: {o_np.shape} -> reshaped to: {o_reshaped.shape}")
+    torch.testing.assert_close(o_torch, o_torch_ref)
+
+    def save_tensor_to_csv(tensor, filename, D):
+        tensor_np = tensor.cpu().numpy()
+        tensor_reshaped = tensor_np.reshape(-1, D)
+        with open(filename, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            header = [f'dim_{i}' for i in range(D)]
+            writer.writerow(header)
+            for row in tensor_reshaped:
+                writer.writerow(row.tolist())
     
+    save_tensor_to_csv(o_torch, 'output_tensor.csv', D)
+    save_tensor_to_csv(o_torch_ref, 'output_tensor_ref.csv', D)
+
