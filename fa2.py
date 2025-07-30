@@ -402,6 +402,10 @@ class HopperFA2:
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.fence()
 
+                # divide tStS by \sqrt{D}
+                tStS_scaled = cute.make_fragment(tStS.layout, cutlass.Float32)
+                tStS_scaled.store(tStS.load().to(cutlass.Float32) / math.sqrt(cute.size(gQ, mode=[1])))
+
                 # use a composition to get the desired matrices that you want.
                 new_row_max = cute.make_fragment_like(old_row_max, cutlass.Float32)
                 new_row_sum = cute.make_fragment_like(old_row_max, cutlass.Float32)
