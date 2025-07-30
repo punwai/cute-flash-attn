@@ -765,8 +765,6 @@ class HopperWgmmaGemmKernel:
             pipeline.PipelineUserType.Consumer, self.ab_stage
         )
 
-        tiled_mma.make_epilogue_atom()
-
         peek_ab_full_status = cutlass.Boolean(1)
         if mainloop_consumer_read_state.count < k_tile_cnt:
             peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
@@ -943,11 +941,23 @@ class HopperWgmmaGemmKernel:
         # (R2S, R2S_M, R2S_N)
         tRS_rAcc = tiled_copy_r2s.retile(accumulators)
 
+        print("tRS_rAcc.shape", tRS_rAcc.shape)
+        print("accumulators.shape", accumulators.shape)
+
+        print("tRS_rAcc")
+        print(tRS_rAcc)
+        print("accumulators")
+        print(accumulators)
+
         # Allocate D registers.
         rD_shape = cute.shape(thr_copy_r2s.partition_S(sc))
         tRS_rD_layout = cute.make_layout(rD_shape[:3])
         tRS_rD = cute.make_fragment_like(tRS_rD_layout, self.acc_dtype)
         size_tRS_rD = cute.size(tRS_rD)
+
+        print("size tRS_rD", size_tRS_rD)
+        print("size accumulators", cute.size(accumulators))
+        print("size tRS_rAcc", cute.size(tRS_rAcc))
 
         sepi_for_tma_partition = cute.group_modes(sc, 0, 2)
         tcgc_for_tma_partition = cute.zipped_divide(gC_mnl, self.epi_tile)

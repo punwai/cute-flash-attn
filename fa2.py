@@ -20,6 +20,8 @@ import cuda.bindings.driver as cuda
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from typing import List, Type, Tuple
+import csv
+import numpy as np
 
 def transpose(tensor: cutlass.Tensor, new_indices: List[int]):
     shape = tuple(tensor.shape[i] for i in new_indices)
@@ -48,22 +50,22 @@ class HopperFA2:
     ):
         q = transpose(q, [2, 3, 1, 0]) # (S_qo, D, H_qo, B)
         k = transpose(k, [2, 3, 1, 0]) # (S_kv, D, H_kv, B)
-        v = transpose(v, [2, 3, 1, 0]) # (S_kv, D, H_kv, B)
+        v = transpose(v, [3, 2, 1, 0]) # (D, S_kv, H_kv, B)
         o = transpose(o, [2, 3, 1, 0]) # (S_qo, D, H_qo, B)
 
-        self.o_layout = utils.LayoutEnum.from_tensor(o)
 
         q_smem_shape = o_smem_shape = (self.cta_tile[0], self.cta_tile[2])
-        k_smem_shape = v_smem_shape = (self.cta_tile[1], self.cta_tile[2])
+        k_smem_shape = (self.cta_tile[1], self.cta_tile[2])
+        v_smem_shape = (self.cta_tile[2], self.cta_tile[1])
 
         self.q_dtype = q.element_type
         self.k_dtype = k.element_type
         self.v_dtype = v.element_type
         self.o_dtype = o.element_type
 
-        def make_smem_layout(smem_shape: Tuple[int, int], dtype: Type[cutlass.Numeric], stages: int):
+        def make_smem_layout(smem_shape: Tuple[int, int], dtype: Type[cutlass.Numeric], stages: int, layout = cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128):
             smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
-                cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128,
+                layout,
                 dtype,
             )
             return cute.tile_to_shape(
@@ -75,12 +77,15 @@ class HopperFA2:
         # 1. initialize shared-memory layout.
         self.q_smem_layout_staged = make_smem_layout(q_smem_shape, self.q_dtype, stages=1)
         self.k_smem_layout_staged = make_smem_layout(k_smem_shape, self.k_dtype, self.kv_pipeline_stages)
-        self.v_smem_layout_staged = make_smem_layout(v_smem_shape, self.v_dtype, self.kv_pipeline_stages)
+        self.v_smem_layout_staged = make_smem_layout(v_smem_shape, self.v_dtype, self.kv_pipeline_stages, layout=cute.nvgpu.warpgroup.SmemLayoutAtomKind.MN_SW128)
         self.o_smem_layout_staged = make_smem_layout(o_smem_shape, self.q_dtype, stages=1)
         self.q_smem_layout_unstaged = cute.slice_(self.q_smem_layout_staged, (None, None, 0))
         self.k_smem_layout_unstaged = cute.slice_(self.k_smem_layout_staged, (None, None, 0))
         self.v_smem_layout_unstaged = cute.slice_(self.v_smem_layout_staged, (None, None, 0))
         self.o_smem_layout_unstaged = cute.slice_(self.o_smem_layout_staged, (None, None, 0))
+
+        print("q_smem_layout_staged", self.q_smem_layout_staged)
+        print("o_smem_layout_unstaged", self.o_smem_layout_unstaged)
 
         # 2. setup tma atoms and tensors.
         g2s_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
@@ -101,7 +106,7 @@ class HopperFA2:
             g2s_op,
             v,
             self.v_smem_layout_unstaged,
-            (self.cta_tile[1], self.cta_tile[2])
+            (self.cta_tile[2], self.cta_tile[1])
         )
         o_tma_atom, o_tma_tensor = cute.nvgpu.cpasync.make_tiled_tma_atom(
             s2g_op,
@@ -109,6 +114,9 @@ class HopperFA2:
             self.o_smem_layout_unstaged,
             (self.cta_tile[0], self.cta_tile[2])
         )
+
+        self.o_layout = utils.LayoutEnum.from_tensor(o)
+
 
         # 4. setup shared storage.
 
@@ -136,14 +144,13 @@ class HopperFA2:
         self.load_warp_id = 0
         self.mma_warp_ids = [4, 5, 6, 7]
 
-        mm = cute.nvgpu.warpgroup.OperandMajorMode.K
         self.atom_layout_mnk = (1, 1, 1)
         self.acc_dtype = cutlass.Float32
         self.tiled_mma_qk = sm90_utils.make_trivial_tiled_mma(
             self.q_dtype,
             self.k_dtype,
-            mm,
-            mm,
+            cute.nvgpu.warpgroup.OperandMajorMode.K,
+            cute.nvgpu.warpgroup.OperandMajorMode.K,
             self.acc_dtype,
             self.atom_layout_mnk,
             tiler_mn=(self.cta_tile[0], self.cta_tile[1]),
@@ -152,10 +159,11 @@ class HopperFA2:
         self.tiled_mma_v = sm90_utils.make_trivial_tiled_mma(
             self.q_dtype,
             self.v_dtype,
-            mm,
-            mm,
+            cute.nvgpu.warpgroup.OperandMajorMode.K,
+            cute.nvgpu.warpgroup.OperandMajorMode.MN,
             self.acc_dtype,
             self.atom_layout_mnk,
+            # gemm(P, V.T)
             tiler_mn=(self.cta_tile[1], self.cta_tile[2]),
             a_source=OperandSource.RMEM,
         )
@@ -252,7 +260,7 @@ class HopperFA2:
 
         gQ_tiled = cute.flat_divide(gQ, (self.cta_tile[0], self.cta_tile[2])) # (S_qo, D, H_qo, B)
         gK_tiled = cute.flat_divide(gK, (self.cta_tile[1], self.cta_tile[2])) # (S_kv, D, H_kv, B)
-        gV_tiled = cute.flat_divide(gV, (self.cta_tile[1], self.cta_tile[2])) # (S_kv, D, H_kv, B)
+        gV_tiled = cute.flat_divide(gV, (self.cta_tile[2], self.cta_tile[1])) # (S_kv, D, H_kv, B)
         gQ_local = gQ_tiled[*(None, None), *(bidx, None, bidy, bidz)] # (tile_M, tile_N, 1)
         gK_local = gK_tiled[*(None, None), *(None, 0, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
         gV_local = gV_tiled[*(None, None), *(None, 0, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
@@ -347,7 +355,7 @@ class HopperFA2:
             (self.cta_tile[1], self.cta_tile[2])
         )
         v_A_shape = v_thr_mma.partition_shape_A(
-            (self.cta_tile[0], self.cta_tile[1])
+            (self.cta_tile[1], self.cta_tile[1])
         )
         tStO = cute.make_fragment(o_acc_shape, self.acc_dtype)
         tStO.fill(0.0)
@@ -366,9 +374,13 @@ class HopperFA2:
             running_sum = cute.make_fragment_like(old_row_max, cutlass.Float32)
             running_sum.fill(0.0)
 
+
             for k_block in cutlass.range(num_kv_blocks, unroll=1):
                 load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
                 num_k_microtiles = cute.size(tCrK, mode=[2])
+                
+                # M * K = (64, 64)
+                # N * K = (64, 128)
 
                 tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
                 cute.nvgpu.warpgroup.fence()
@@ -394,16 +406,14 @@ class HopperFA2:
                 log2_e = math.log2(math.e)
                 for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0])):
                     row_tensor = tStS[(None, i, None), 0, 0]
+                    row_output = tStO[(None, i, None), 0, 0]
                     row_ssa = row_tensor.load()
                     row_max = row_ssa.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
-
                     for j in cutlass.range_constexpr(2):
                         row_max = cutlass.max(row_max, cute.arch.shuffle_sync_bfly(row_max, 1 << j))
 
                     new_row_max[i] = cutlass.max(old_row_max[i], row_max)
                     row_p = cute.exp2((row_ssa - new_row_max[i]) * log2_e)
-
-
                     row_tensor.store(row_p)
 
                     row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, 0)
@@ -411,7 +421,6 @@ class HopperFA2:
                         row_sum += cute.arch.shuffle_sync_bfly(row_sum, 1 << j)
 
                     scaling_factor[i] = cute.arch.exp2((old_row_max[i] - new_row_max[i]) * log2_e)
-
                     new_row_sum[i] = row_sum
 
                     if k_block != 0:
@@ -419,7 +428,7 @@ class HopperFA2:
                     running_sum[i] += new_row_sum[i]
 
                     if k_block != 0:
-                        tStO.store(tStO.load() / scaling_factor[i])
+                        row_output.store(row_output.load() / scaling_factor[i])
 
                 old_row_max = new_row_max
 
@@ -444,49 +453,51 @@ class HopperFA2:
                         tStO,
                     )
                     tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                
-                cute.nvgpu.warpgroup.commit_group()
-                cute.nvgpu.warpgroup.fence()
-
-                if tidx % 128 == 0:
-                    cute.printf("tStO")
-                    cute.print_tensor(tStO)
 
                 # output scaling
+                cute.nvgpu.warpgroup.commit_group()
+                cute.nvgpu.warpgroup.fence()
                 mma_kv_pipeline_state.advance()
                 load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
 
             # write back the tile to global memory.
-            for i in cutlass.range_constexpr(cute.size(tStO, mode=[0])):
+            for i in cutlass.range_constexpr(tStO.shape[0][1]):
                 tStO_row = tStO[(None, i, None), 0, 0]
                 tStO_row.store(tStO_row.load() / running_sum[i])
 
             copy_atom_r2s = sm90_utils.sm90_get_smem_store_op(
                 self.o_layout,
                 elem_ty_d=self.o_dtype,
-                elem_ty_acc=self.acc_dtype,
+                elem_ty_acc=self.o_dtype,
             )
-            tiled_copy_r2s = cute.make_tiled_copy_C(copy_atom_r2s, tiled_mma_v)
-            # 1a. partition 
-            thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-            tRS_sD = thr_copy_r2s.partition_D(sO)
-            tRS_rAcc = tiled_copy_r2s.retile(tStO)
 
-            # 1b. reformat the partition shape to match a shape that can be used in the cute.copy
-            # despite the best of my efforts, i cannot figure out a way to use the existing accumulator
-            # shapes with the shared tensor shape. so, we're going to make a new fragment that we know
-            # has a valid shape, and we're going to just loop through tRS_rAcc to copy over the elements to tRS_rD.
+            tiled_copy_r2s = cute.make_tiled_copy_C(copy_atom_r2s, tiled_mma_v)
+            # partition
+            thr_copy_r2s = tiled_copy_r2s.get_slice(tidx % 128)
+            tRS_sD = thr_copy_r2s.partition_D(sO)
+            tStO_fp16 = cute.make_fragment(tStO.layout, self.o_dtype)
+            tStO_fp16.store(tStO.load().to(self.o_dtype))
+
+            tRS_rAcc = tiled_copy_r2s.retile(tStO_fp16)
+
             rD_shape = cute.shape(thr_copy_r2s.partition_S(sO))
             tRS_rD_layout = cute.make_layout(rD_shape[:3])
             tRS_rD = cute.make_fragment_like(tRS_rD_layout, self.o_dtype)
-
-            tStO_fp16 = cute.make_fragment(tStO.layout, self.o_dtype)
-            tStO_fp16.store(tStO.load().to(self.o_dtype))
 
             for i in range(cute.size(tRS_rD)):
                 tRS_rD[i] = tStO_fp16[i]
 
             cute.copy(tiled_copy_r2s, tRS_rD, tRS_sD[(None, None, None, 0)])
+
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared,
+                space=cute.arch.SharedSpace.shared_cta,
+            )
+            cute.arch.barrier()
+
+            if tidx % 128 == 0:
+                cute.printf("sO")
+                cute.print_tensor(sO)
 
             # # perform the smem -> gmem copy.
             sepi_for_tma_partition = cute.group_modes(sO, 0, 2)
@@ -518,9 +529,13 @@ if __name__ == "__main__":
     q_torch = torch.ones(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
     for i in range(S_qo):
         q_torch[:, :, i, :] = q_torch[:, :, i, :] * (i + 1)
+
     k_torch = torch.ones(B, H_kv, S_kv, D, dtype=torch.float16, device="cuda")
 
-    v_torch = torch.ones(B, H_kv, S_kv, D, dtype=torch.float16, device="cuda")
+    v_torch = torch.ones(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
+    for i in range(D):
+        v_torch[:, :, :, i] = v_torch[:, :, :, i] * (i + 1)
+
     o_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
 
     q = cutlass_torch.from_dlpack(q_torch, assumed_align=16)
@@ -533,4 +548,16 @@ if __name__ == "__main__":
     hopper_fa = HopperFA2(cta_tile=(64, 64, 128))
     compiled_kernel = cute.compile(hopper_fa, q, k, v, o, stream)
     compiled_kernel(q, k, v, o, stream)
+
+    o_np = o_torch.cpu().numpy()
+    o_reshaped = o_np.reshape(-1, D)
+    with open('output_tensor.csv', 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        header = [f'dim_{i}' for i in range(D)]
+        writer.writerow(header)
+        for row in o_reshaped:
+            writer.writerow(row.tolist())
+
+    print(f"Output tensor written to output_tensor.csv")
+    print(f"Shape: {o_np.shape} -> reshaped to: {o_reshaped.shape}")
     
