@@ -419,15 +419,13 @@ class HopperFA2:
                 # once you've performed the gemm, 
                 tOtO.store(tStO.load())
 
-
                 mma_kv_pipeline_state.advance()
                 load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
 
 
 
 if __name__ == "__main__":
-
-    head_dims = 128
+    head_dims = 256
     batch_size = 4
     num_key_heads = 16
     group_size = 16

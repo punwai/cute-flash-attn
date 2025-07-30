@@ -4,10 +4,6 @@
 # note: there is zero reason that you would not be able to execute on this within 1 day.
 # you've basically learned all the fundamentals. if you need to uncover something more,
 # you know the playbook. just isolate the component, make minimal tests, play around with it.
-# imagine how you used to learn python when you were 10 years old. execution feedback, isolated environments
-# understand how things work deeply, and what is going on.
-# although benchmarking might take longer, you should be able to do the bulk of the kernel work in 1 day.
-# this is not a problem, and there is basically a playbook for every single section.
 
 import cutlass
 import cutlass.cute as cute
@@ -510,20 +506,22 @@ class HopperFA2:
                 tcgc_for_tma_partition,
             )
 
+            print("bSG_sD.shape", bSG_sD.shape)
+            print("bSG_gD.shape", bSG_gD.shape)
+
             cute.copy(
                 o_tma_atom,
                 bSG_sD[(None, 0)],
                 bSG_gD[(None, 0)],
             )
 
-
 if __name__ == "__main__":
-    head_dims = 128
-    batch_size = 1
-    num_key_heads = 1
+    head_dims = 64
+    batch_size = 3
+    num_key_heads = 4
     group_size = 1
-    qo_seq_len = 64
-    kv_seq_len = 64
+    qo_seq_len = 128
+    kv_seq_len = 128
     B, S_qo, S_kv, H_kv, H_qo, D = batch_size, qo_seq_len, kv_seq_len, num_key_heads, num_key_heads * group_size, head_dims
 
     q_torch = torch.ones(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
@@ -545,7 +543,7 @@ if __name__ == "__main__":
 
     stream = cuda.CUstream()
 
-    hopper_fa = HopperFA2(cta_tile=(64, 64, 128))
+    hopper_fa = HopperFA2(cta_tile=(64, 64, 64))
     compiled_kernel = cute.compile(hopper_fa, q, k, v, o, stream)
     compiled_kernel(q, k, v, o, stream)
 
