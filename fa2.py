@@ -506,7 +506,6 @@ class HopperFA2:
             )
 
 
-
 if __name__ == "__main__":
     head_dims = 128
     batch_size = 1
