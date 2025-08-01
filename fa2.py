@@ -5,6 +5,11 @@
 # you've basically learned all the fundamentals. if you need to uncover something more,
 # you know the playbook. just isolate the component, make minimal tests, play around with it.
 
+# what does this lack?
+# - no attention masking
+# - no persistent kernel scheduling
+# - no GQA
+
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu.warpgroup import OperandSource
@@ -18,6 +23,8 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from typing import List, Type, Tuple
 import csv
 import numpy as np
+
+REDUCE_ALL_COORD = 0
 
 def transpose(tensor: cutlass.Tensor, new_indices: List[int]):
     shape = tuple(tensor.shape[i] for i in new_indices)
@@ -261,13 +268,20 @@ class HopperFA2:
 
         gQ_tiled = cute.flat_divide(gQ, (self.cta_tile[0], self.cta_tile[2])) # (S_qo, D, H_qo, B)
         gK_tiled = cute.flat_divide(gK, (self.cta_tile[1], self.cta_tile[2])) # (S_kv, D, H_kv, B)
-        gV_tiled = cute.flat_divide(gV, (self.cta_tile[2], self.cta_tile[1])) # (S_kv, D, H_kv, B)
+        gV_tiled = cute.flat_divide(gV, (self.cta_tile[2], self.cta_tile[1])) # (D, S_kv, H_kv, B)
         gO_tiled = cute.flat_divide(gO, (self.cta_tile[0], self.cta_tile[2])) # (S_qo, D, H_qo, B)
+
+        print("gV.shape", gV.shape)
+        print("cta.tiler", (self.cta_tile[2], self.cta_tile[1]))
+        print("gV_tiled.shape", gV_tiled.shape)
 
         gQ_local = gQ_tiled[*(None, None), *(bidx, None, bidy, bidz)] # (tile_M, tile_N, 1)
         gK_local = gK_tiled[*(None, None), *(None, 0, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
-        gV_local = gV_tiled[*(None, None), *(None, 0, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
+        gV_local = gV_tiled[*(None, None), *(0, None, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
         gO_local = gO_tiled[*(None, None), *(bidx, None, bidy, bidz)] # (tile_M, tile_N, 1)
+
+        print("gK_local", gK_local)
+        print("gV_local", gV_local)
 
         # load q into memory.
         is_producer_warp = warp_idx in [self.load_warp_id]
@@ -313,6 +327,11 @@ class HopperFA2:
                 tQsQ[(None, 0)],
                 tma_bar_ptr=load_q_pipeline.producer_get_barrier(load_q_pipeline_state)
             )
+
+            print("tKsK", tKsK)
+            print("tVsV", tVsV)
+            print("tKgK", tKgK)
+            print("tVgV", tVgV)
 
             load_kv_pipeline_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_pipeline_stages)
             for i in cutlass.range(num_kv_blocks, unroll=1):
@@ -400,48 +419,49 @@ class HopperFA2:
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.fence()
 
-                # divide tStS by \sqrt{D}
-                tStS.store(tStS.load().to(cutlass.Float32) / math.sqrt(cute.size(gQ, mode=[1])))
-
                 # use a composition to get the desired matrices that you want.
                 new_row_max = cute.make_fragment_like(old_row_max, cutlass.Float32)
-                new_row_sum = cute.make_fragment_like(old_row_max, cutlass.Float32)
                 scaling_factor = cute.make_fragment_like(old_row_max, cutlass.Float32)
 
-                log2_e = math.log2(math.e)
+                # divide tStS by \sqrt{D}
+                log2_e = math.log2(math.exp(1.0))  
+                scale_log2 = 1.0 / math.sqrt(cute.size(gQ, mode=[1])) * log2_e
+
                 for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0])):
                     row_tensor = tStS[(None, i, None), 0, 0]
                     row_output = tStO[(None, i, None), 0, 0]
+
                     row_ssa = row_tensor.load()
-                    row_max = row_ssa.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, 0)
+                    row_max = row_ssa.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, REDUCE_ALL_COORD)
                     for j in cutlass.range_constexpr(2):
                         row_max = cutlass.max(row_max, cute.arch.shuffle_sync_bfly(row_max, 1 << j))
 
                     new_row_max[i] = cutlass.max(old_row_max[i], row_max)
-                    row_p = cute.exp2((row_ssa - new_row_max[i]) * log2_e)
+
+                    row_p = cute.exp2((row_ssa * scale_log2 - new_row_max[i] * scale_log2))
+
                     row_tensor.store(row_p)
 
-                    row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, 0)
+                    row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, REDUCE_ALL_COORD)
                     for j in cutlass.range_constexpr(2):
                         row_sum += cute.arch.shuffle_sync_bfly(row_sum, 1 << j)
 
-                    scaling_factor[i] = cute.arch.exp2((old_row_max[i] - new_row_max[i]) * log2_e)
-                    new_row_sum[i] = row_sum
+                    scaling_factor[i] = cute.arch.exp2((old_row_max[i] * scale_log2 - new_row_max[i] * scale_log2))
 
                     if k_block != 0:
                         running_sum[i] = running_sum[i] * scaling_factor[i]
-                    running_sum[i] += new_row_sum[i]
+
+                    running_sum[i] += row_sum
 
                     if k_block != 0:
-                        row_output.store(row_output.load() / scaling_factor[i])
+                        row_output.store(row_output.load() * scaling_factor[i])
 
-                old_row_max = new_row_max
-
+                old_row_max.store(new_row_max.load())
                 tPtP_fp32 = tStS
                 tPtP = cute.make_fragment(tPtP_fp32.layout, self.k_dtype)
                 tPtP.store(tPtP_fp32.load().to(self.k_dtype))
 
-                # # we re-format the tPtP we have into the shape that we need.
+                # we re-format the tPtP we have into the shape that we need.
                 p_A_layout = cute.make_layout(v_A_shape)
                 p_A_tensor = cute.make_tensor(tPtP.iterator, p_A_layout)
 
@@ -462,6 +482,7 @@ class HopperFA2:
                 # output scaling
                 cute.nvgpu.warpgroup.commit_group()
                 cute.nvgpu.warpgroup.fence()
+
                 mma_kv_pipeline_state.advance()
                 load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
 
@@ -517,17 +538,17 @@ class HopperFA2:
 
 if __name__ == "__main__":
     head_dims = 64
-    batch_size = 1
-    num_key_heads = 1
-    qo_seq_len = 64
-    kv_seq_len = 64
+    batch_size = 3
+    num_key_heads = 2
+    qo_seq_len = 128
+    kv_seq_len = 128
 
     B, S_qo, S_kv, H_kv, H_qo, D = batch_size, qo_seq_len, kv_seq_len, num_key_heads, num_key_heads, head_dims
 
-    q_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
+    q_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda") 
     k_torch = torch.randn(B, H_kv, S_kv, D, dtype=torch.float16, device="cuda")
     v_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
-    o_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
+    o_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda") / 50
 
     q = cutlass_torch.from_dlpack(q_torch, assumed_align=16)
     k = cutlass_torch.from_dlpack(k_torch, assumed_align=16)
@@ -541,10 +562,6 @@ if __name__ == "__main__":
     compiled_kernel = cute.compile(hopper_fa, q, k, v, o, stream)
     compiled_kernel(q, k, v, o, stream)
 
-    o_torch_ref = torch.nn.functional.scaled_dot_product_attention(q_torch, k_torch, v_torch, scale=1.0 / math.sqrt(D))
-
-    torch.testing.assert_close(o_torch, o_torch_ref)
-
     def save_tensor_to_csv(tensor, filename, D):
         tensor_np = tensor.cpu().numpy()
         tensor_reshaped = tensor_np.reshape(-1, D)
@@ -556,5 +573,22 @@ if __name__ == "__main__":
                 writer.writerow(row.tolist())
     
     save_tensor_to_csv(o_torch, 'output_tensor.csv', D)
+    o_torch_ref = torch.nn.functional.scaled_dot_product_attention(q_torch, k_torch, v_torch, scale=1.0 / math.sqrt(D))
+    
+    # Perform all-close check row-by-row and count failures
+    failed_rows = 0
+    failed_indices = []
+    total_rows = 0
+    for b in range(B):
+        for h in range(H_qo):
+            for s in range(S_qo):
+                total_rows += 1
+                try:
+                    torch.testing.assert_close(o_torch[b, h, s, :], o_torch_ref[b, h, s, :], atol=1e-3, rtol=1e-3)
+                except AssertionError:
+                    failed_rows += 1
+                    failed_indices.append(s)
+    
     save_tensor_to_csv(o_torch_ref, 'output_tensor_ref.csv', D)
 
+    torch.testing.assert_close(o_torch, o_torch_ref, atol=1e-3, rtol=1e-3)

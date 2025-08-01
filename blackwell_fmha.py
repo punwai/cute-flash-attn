@@ -2927,9 +2927,9 @@ def run_fmha_and_verify(
 
     if scale_softmax == 0.0:  # default to 1/sqrt(d)
         scale_softmax = 1.0 / math.sqrt(d)
-    log2_e = math.log2(
-        math.exp(1.0)
-    )  # gpu uses exp2 for perf concerns, we need an extra factor 'log2_e' here
+    log2_e = math.log2(math.exp(1.0))  
+
+    # gpu uses exp2 for perf concerns, we need an extra factor 'log2_e' here
 
     scale_softmax = scale_q * scale_k * scale_softmax
     scale_softmax_log2 = scale_softmax * log2_e
