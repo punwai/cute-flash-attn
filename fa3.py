@@ -45,7 +45,6 @@ class HopperFA2:
         k: cutlass.Tensor, # (B, H_kv, S_kv, D) [DANGER: transpose later on]
         v: cutlass.Tensor, # (B, H_kv, S_kv, D) [DANGER: transpose later on]
         o: cutlass.Tensor, # (B, H_qo, S_qo, D) [DANGER: transpose later on]
-        stream: cuda.CUstream,
     ):
         q = transpose(q, [2, 3, 1, 0]) # (S_qo, D, H, B)
         k = transpose(k, [2, 3, 1, 0]) # (S_kv, D, H, B)
@@ -192,7 +191,6 @@ class HopperFA2:
             block=[256, 1, 1],
             cluster=[1, 1, 1],
             smem=self.shared_storage.size_in_bytes(),
-            stream=stream,
         )
 
     @cute.kernel
@@ -254,7 +252,6 @@ class HopperFA2:
 
         load_kv_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len([self.load_warp_id]))
         load_kv_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len(self.mma_warp_ids))
-
         load_kv_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.kv_pipeline_stages,
             producer_group=load_kv_producer_group,
@@ -326,7 +323,6 @@ class HopperFA2:
             )
 
             load_kv_pipeline_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_pipeline_stages)
-
             for i in cutlass.range(num_kv_blocks, unroll=1):
                 load_kv_pipeline.producer_acquire(load_kv_pipeline_state)
 
@@ -349,6 +345,7 @@ class HopperFA2:
                 )
                 load_kv_pipeline_state.advance()
 
+
         qk_thr_mma = tiled_mma_qk.get_slice(tidx)
         tCsK = qk_thr_mma.partition_A(sK)
         tCsQ = qk_thr_mma.partition_B(sQ)
@@ -369,7 +366,7 @@ class HopperFA2:
         o_acc_shape = v_thr_mma.partition_shape_C(
             (self.cta_tile[1], self.cta_tile[2])
         )
-        v_A_shape = v_thr_mma.partition_shape_A(
+        pv_mma_A_input_shape = v_thr_mma.partition_shape_A(
             (self.cta_tile[1], self.cta_tile[1])
         )
         tStO = cute.make_fragment(o_acc_shape, self.acc_dtype)
@@ -378,10 +375,7 @@ class HopperFA2:
         if is_consumer_warp:
             # run mma
             mma_kv_pipeline_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_pipeline_stages)
-            mma_kv_pipeline_state_lagging = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.kv_pipeline_stages)
-
             mma_q_pipeline_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
-
             load_q_pipeline.consumer_wait(mma_q_pipeline_state)
             load_q_pipeline.consumer_release(mma_q_pipeline_state)
             # each thread contains the accumulator outputs from 2 separate accumulators.
@@ -392,111 +386,39 @@ class HopperFA2:
             running_sum = cute.make_fragment_like(old_row_max, cutlass.Float32)
             running_sum.fill(0.0)
 
-            num_k_microtiles = cute.size(tCrK, mode=[2])
-
-            # do the first QK^T first
-            load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
-
-            tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-            for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
-                q_block_coord = (None, None, k_microtile_ix, 0)
-                k_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
-                cute.gemm(
+            for k_block in cutlass.range(num_kv_blocks, unroll=1):
+                load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
+                cute.nvgpu.warpgroup.fence()
+                self.gemm_qk(
                     tiled_mma_qk,
                     tStS,
-                    tCrQ[q_block_coord],
-                    tCrK[k_block_coord],
-                    tStS,
+                    tCrQ,
+                    tCrK,
+                    mma_kv_pipeline_state.index,
                 )
-                tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                cute.nvgpu.warpgroup.fence()
 
-            cute.nvgpu.warpgroup.commit_group()
-            cute.nvgpu.warpgroup.fence()
-
-            mma_kv_pipeline_state.advance()
-
-            for k_block in cutlass.range(1, num_kv_blocks, unroll=1):
-                load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
-
-                # M * K = (64, 64)
-                # N * K = (64, 128)
-                tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-                for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
-                    q_block_coord = (None, None, k_microtile_ix, 0)
-                    k_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
-                    cute.gemm(
-                        tiled_mma_qk,
-                        tStS,
-                        tCrQ[q_block_coord],
-                        tCrK[k_block_coord],
-                        tStS,
-                    )
-                    tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                cute.nvgpu.warpgroup.commit_group()
-
-                # Compute the KV for the 
-                new_row_max = cute.make_fragment_like(old_row_max, cutlass.Float32)
-                scaling_factor = cute.make_fragment_like(old_row_max, cutlass.Float32)
-
-                # divide tStS by \sqrt{D}
                 log2_e = math.log2(math.exp(1.0))  
                 scale_log2 = 1.0 / math.sqrt(cute.size(gQ, mode=[1])) * log2_e
+                tPtP = self.online_softmax(
+                    tStO,
+                    tStS,
+                    old_row_max,
+                    running_sum,
+                    scale_log2,
+                    k_block == 0,
+                )
 
-                for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0])):
-                    row_tensor = tStS[(None, i, None), 0, 0]
-                    row_output = tStO[(None, i, None), 0, 0]
+                p_A_tensor = cute.make_tensor(tPtP.iterator, cute.make_layout(pv_mma_A_input_shape))
 
-                    row_ssa = row_tensor.load()
-                    row_max = row_ssa.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, REDUCE_ALL_COORD)
-                    for j in cutlass.range_constexpr(2):
-                        row_max = cutlass.max(row_max, cute.arch.shuffle_sync_bfly(row_max, 1 << j))
-
-                    new_row_max[i] = cutlass.max(old_row_max[i], row_max)
-
-                    row_p = cute.exp2((row_ssa * scale_log2 - new_row_max[i] * scale_log2))
-
-                    row_tensor.store(row_p)
-
-                    row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, REDUCE_ALL_COORD)
-                    for j in cutlass.range_constexpr(2):
-                        row_sum += cute.arch.shuffle_sync_bfly(row_sum, 1 << j)
-
-                    scaling_factor[i] = cute.arch.exp2((old_row_max[i] * scale_log2 - new_row_max[i] * scale_log2))
-
-                    if k_block != 0:
-                        running_sum[i] = running_sum[i] * scaling_factor[i]
-
-                    running_sum[i] += row_sum
-
-                    if k_block != 0:
-                        row_output.store(row_output.load() * scaling_factor[i])
-
-                old_row_max.store(new_row_max.load())
-                tPtP_fp32 = tStS
-                tPtP = cute.make_fragment(tPtP_fp32.layout, self.k_dtype)
-                tPtP.store(tPtP_fp32.load().to(self.k_dtype))
-
-                # we re-format the tPtP we have into the shape that we need.
-                p_A_layout = cute.make_layout(v_A_shape)
-                p_A_tensor = cute.make_tensor(tPtP.iterator, p_A_layout)
-
-                # output scaling
-                num_k_microtiles = cute.size(p_A_tensor, mode=[2])
-                for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
-                    p_block_coord = (None, None, k_microtile_ix)
-                    v_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
-                    cute.gemm(
-                        tiled_mma_v,
-                        tStO,
-                        p_A_tensor[p_block_coord],
-                        tCrV[v_block_coord],
-                        tStO,
-                    )
-                    tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-
-                # output scaling
-                cute.nvgpu.warpgroup.commit_group()
-                cute.nvgpu.warpgroup.fence()
+                tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                self.gemm_pv(
+                    tiled_mma_v,
+                    tStO,
+                    p_A_tensor,
+                    tCrV,
+                    mma_kv_pipeline_state.index,
+                )
 
                 mma_kv_pipeline_state.advance()
                 load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
@@ -551,13 +473,115 @@ class HopperFA2:
                 bSG_gD[(None, 0)],
             )
 
+
+
+    @cute.jit
+    def online_softmax(
+        self,
+        tStO: cutlass.Tensor, 
+        tStS: cutlass.Tensor, 
+        old_row_max: cutlass.Tensor, 
+        running_sum: cutlass.Tensor, 
+        scale_log2: cutlass.Float32,
+        first_block: bool,
+    ):
+        # use a composition to get the desired matrices that you want.
+        new_row_max = cute.make_fragment_like(old_row_max, cutlass.Float32)
+        scaling_factor = cute.make_fragment_like(old_row_max, cutlass.Float32)
+        # divide tStS by \sqrt{D}
+
+        for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0])):
+            row_tensor = tStS[(None, i, None), 0, 0]
+            row_output = tStO[(None, i, None), 0, 0]
+
+            row_ssa = row_tensor.load()
+            row_max = row_ssa.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, REDUCE_ALL_COORD)
+            for j in cutlass.range_constexpr(2):
+                row_max = cutlass.max(row_max, cute.arch.shuffle_sync_bfly(row_max, 1 << j))
+
+            new_row_max[i] = cutlass.max(old_row_max[i], row_max)
+
+            row_p = cute.exp2((row_ssa * scale_log2 - new_row_max[i] * scale_log2))
+
+            row_tensor.store(row_p)
+
+            row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, REDUCE_ALL_COORD)
+            for j in cutlass.range_constexpr(2):
+                row_sum += cute.arch.shuffle_sync_bfly(row_sum, 1 << j)
+
+            scaling_factor[i] = cute.arch.exp2((old_row_max[i] * scale_log2 - new_row_max[i] * scale_log2))
+
+            if not first_block:
+                running_sum[i] = running_sum[i] * scaling_factor[i]
+
+            running_sum[i] += row_sum
+
+            if not first_block:
+                row_output.store(row_output.load() * scaling_factor[i])
+
+        old_row_max.store(new_row_max.load())
+        tPtP_fp32 = tStS
+        tPtP = cute.make_fragment(tPtP_fp32.layout, self.k_dtype)
+        tPtP.store(tPtP_fp32.load().to(self.k_dtype))
+        return tPtP
+
+    @cute.jit
+    def gemm_qk(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tStS: cutlass.Tensor,
+        tCrQ: cutlass.Tensor,
+        tCrK: cutlass.Tensor,
+        pipeline_index: int,
+    ):
+        # M * K = (64, 64)
+        tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
+        for k_microtile_ix in cutlass.range_constexpr(cute.size(tCrK, mode=[2])):
+            q_block_coord = (None, None, k_microtile_ix, 0)
+            k_block_coord = (None, None, k_microtile_ix, pipeline_index)
+            cute.gemm(
+                tiled_mma_qk,
+                tStS,
+                tCrQ[q_block_coord],
+                tCrK[k_block_coord],
+                tStS,
+            )
+            tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+        cute.nvgpu.warpgroup.commit_group()
+
+        
+    @cute.jit
+    def gemm_pv(
+        self,
+        tiled_mma_v: cute.TiledMma,
+        tStO: cutlass.Tensor,
+        p_A_tensor: cutlass.Tensor,
+        tCrV: cutlass.Tensor,
+        pipeline_index: int,
+    ):
+        num_k_microtiles = cute.size(p_A_tensor, mode=[2])
+        for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
+            p_block_coord = (None, None, k_microtile_ix)
+            v_block_coord = (None, None, k_microtile_ix, pipeline_index)
+            cute.gemm(
+                tiled_mma_v,
+                tStO,
+                p_A_tensor[p_block_coord],
+                tCrV[v_block_coord],
+                tStO,
+            )
+
+        # output scaling
+        cute.nvgpu.warpgroup.commit_group()
+
+
+
 if __name__ == "__main__":
     head_dims = 64
-    batch_size = 3
-    num_key_heads = 2
-    qo_seq_len = 1024
-    kv_seq_len = 1024
-
+    batch_size = 12
+    num_key_heads = 4
+    qo_seq_len = 4096 * 2
+    kv_seq_len = 4096 * 2
     B, S_qo, S_kv, H_kv, H_qo, D = batch_size, qo_seq_len, kv_seq_len, num_key_heads, num_key_heads, head_dims
 
     q_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda") 
@@ -570,40 +594,70 @@ if __name__ == "__main__":
     v = cutlass_torch.from_dlpack(v_torch, assumed_align=16)
     o = cutlass_torch.from_dlpack(o_torch, assumed_align=16)
 
-    stream = cuda.CUstream()
+    stream = torch.cuda.current_stream()
 
     # compute the output of the kernel
     hopper_fa = HopperFA2(cta_tile=(64, 64, 64))
-    compiled_kernel = cute.compile(hopper_fa, q, k, v, o, stream)
-    compiled_kernel(q, k, v, o, stream)
+    compiled_kernel = cute.compile(hopper_fa, q, k, v, o)
 
-    def save_tensor_to_csv(tensor, filename, D):
-        tensor_np = tensor.cpu().numpy()
-        tensor_reshaped = tensor_np.reshape(-1, D)
-        with open(filename, 'w', newline='') as csvfile:
-            writer = csv.writer(csvfile)
-            header = [f'dim_{i}' for i in range(D)]
-            writer.writerow(header)
-            for row in tensor_reshaped:
-                writer.writerow(row.tolist())
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    # Warmup iterations
+    num_warmup = 5
+    for _ in range(num_warmup):
+        compiled_kernel(q, k, v, o)
     
-    save_tensor_to_csv(o_torch, 'output_tensor.csv', D)
+    torch.cuda.synchronize()
+
+    start_event.record(stream=stream)
+
+    num_iterations = 10
+
+    for _ in range(num_iterations):
+        compiled_kernel(q, k, v, o)
+
+    end_event.record(stream=stream)
+    torch.cuda.synchronize()
+
+    elapsed_time = start_event.elapsed_time(end_event)
+
+    avg_time_ms = elapsed_time / num_iterations
+    print(f"Average execution time: {avg_time_ms:.4f} ms")
+
+    qk_flops = 2 * B * H_qo * S_qo * S_kv * D
+    pv_flops = 2 * B * H_qo * S_qo * S_kv * D
+    # softmax_flops = B * H_qo * S_qo * S_kv * 3
+    total_flops = qk_flops + pv_flops
+    print(f"FLOP/s: {total_flops / avg_time_ms / 1e9:.2f} TFLOP/s")
+
+    # def save_tensor_to_csv(tensor, filename, D):
+    #     tensor_np = tensor.cpu().numpy()
+    #     tensor_reshaped = tensor_np.reshape(-1, D)
+    #     with open(filename, 'w', newline='') as csvfile:
+    #         writer = csv.writer(csvfile)
+    #         header = [f'dim_{i}' for i in range(D)]
+    #         writer.writerow(header)
+    #         for row in tensor_reshaped:
+    #             writer.writerow(row.tolist())
+    
+    # save_tensor_to_csv(o_torch, 'output_tensor.csv', D)
     o_torch_ref = torch.nn.functional.scaled_dot_product_attention(q_torch, k_torch, v_torch, scale=1.0 / math.sqrt(D))
     
-    # Perform all-close check row-by-row and count failures
-    failed_rows = 0
-    failed_indices = []
-    total_rows = 0
-    for b in range(B):
-        for h in range(H_qo):
-            for s in range(S_qo):
-                total_rows += 1
-                try:
-                    torch.testing.assert_close(o_torch[b, h, s, :], o_torch_ref[b, h, s, :], atol=1e-3, rtol=1e-3)
-                except AssertionError:
-                    failed_rows += 1
-                    failed_indices.append(s)
+    # # Perform all-close check row-by-row and count failures
+    # failed_rows = 0
+    # failed_indices = []
+    # total_rows = 0
+    # for b in range(B):
+    #     for h in range(H_qo):
+    #         for s in range(S_qo):
+    #             total_rows += 1
+    #             try:
+    #                 torch.testing.assert_close(o_torch[b, h, s, :], o_torch_ref[b, h, s, :], atol=1e-3, rtol=1e-3)
+    #             except AssertionError:
+    #                 failed_rows += 1
+    #                 failed_indices.append(s)
     
-    save_tensor_to_csv(o_torch_ref, 'output_tensor_ref.csv', D)
+    # save_tensor_to_csv(o_torch_ref, 'output_tensor_ref.csv', D)
 
     torch.testing.assert_close(o_torch, o_torch_ref, atol=1e-3, rtol=1e-3)
