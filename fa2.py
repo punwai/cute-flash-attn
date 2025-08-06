@@ -60,7 +60,7 @@ class HopperFA2:
         self.v_dtype = v.element_type
         self.o_dtype = o.element_type
 
-        def make_smem_layout(smem_shape: Tuple[int, int], dtype: Type[cutlass.Numeric], stages: int, layout = cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128):
+        def make_smem_layout(smem_shape: Tuple[int, int], dtype: Type[cutlass.Numeric], stages: int, layout = cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW64):
             smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
                 layout,
                 dtype,
@@ -328,7 +328,7 @@ class HopperFA2:
             print("tVgV", tVgV)
 
             load_kv_pipeline_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.kv_pipeline_stages)
-            for i in cutlass.range(num_kv_blocks, unroll=1):
+            for i in cutlass.range(num_kv_blocks):
                 load_kv_pipeline.producer_acquire(load_kv_pipeline_state)
 
                 sK_chunk = tKsK[(None, load_kv_pipeline_state.index)]
@@ -391,14 +391,14 @@ class HopperFA2:
             running_sum = cute.make_fragment_like(old_row_max, cutlass.Float32)
             running_sum.fill(0.0)
 
-            for k_block in cutlass.range(num_kv_blocks, unroll=1):
+            for k_block in cutlass.range(num_kv_blocks):
                 load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
                 num_k_microtiles = cute.size(tCrK, mode=[2])
 
                 # M * K = (64, 64)
                 # N * K = (64, 128)
                 tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-                for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
+                for k_microtile_ix in cutlass.range_constexpr(num_k_microtiles, unroll=1, unroll_full=True):
                     q_block_coord = (None, None, k_microtile_ix, 0)
                     k_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
                     cute.gemm(
@@ -421,13 +421,13 @@ class HopperFA2:
                 log2_e = math.log2(math.exp(1.0))  
                 scale_log2 = 1.0 / math.sqrt(cute.size(gQ, mode=[1])) * log2_e
 
-                for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0])):
+                for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0]), unroll_full=True):
                     row_tensor = tStS[(None, i, None), 0, 0]
                     row_output = tStO[(None, i, None), 0, 0]
 
                     row_ssa = row_tensor.load()
                     row_max = row_ssa.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, REDUCE_ALL_COORD)
-                    for j in cutlass.range_constexpr(2):
+                    for j in cutlass.range_constexpr(2, unroll=1, unroll_full=True):
                         row_max = cutlass.max(row_max, cute.arch.shuffle_sync_bfly(row_max, 1 << j))
 
                     new_row_max[i] = cutlass.max(old_row_max[i], row_max)
@@ -437,7 +437,7 @@ class HopperFA2:
                     row_tensor.store(row_p)
 
                     row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, REDUCE_ALL_COORD)
-                    for j in cutlass.range_constexpr(2):
+                    for j in cutlass.range_constexpr(2, unroll=1, unroll_full=True):
                         row_sum += cute.arch.shuffle_sync_bfly(row_sum, 1 << j)
 
                     scaling_factor[i] = cute.arch.exp2((old_row_max[i] * scale_log2 - new_row_max[i] * scale_log2))
@@ -461,7 +461,7 @@ class HopperFA2:
 
                 # output scaling
                 num_k_microtiles = cute.size(p_A_tensor, mode=[2])
-                for k_microtile_ix in cutlass.range(num_k_microtiles, unroll=1):
+                for k_microtile_ix in cutlass.range_constexpr(num_k_microtiles, unroll=1, unroll_full=True):
                     p_block_coord = (None, None, k_microtile_ix)
                     v_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
                     cute.gemm(
@@ -480,7 +480,7 @@ class HopperFA2:
                 load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
 
             # write back the tile to global memory.
-            for i in cutlass.range_constexpr(tStO.shape[0][1]):
+            for i in cutlass.range_constexpr(tStO.shape[0][1], unroll=1):
                 tStO_row = tStO[(None, i, None), 0, 0]
                 tStO_row.store(tStO_row.load() / running_sum[i])
 
@@ -535,14 +535,14 @@ if __name__ == "__main__":
     head_dims = 64
     batch_size = 12
     num_key_heads = 4
-    qo_seq_len = 4096 * 2
-    kv_seq_len = 4096 * 2
+    qo_seq_len = 4096 * 4
+    kv_seq_len = 4096 * 4
     B, S_qo, S_kv, H_kv, H_qo, D = batch_size, qo_seq_len, kv_seq_len, num_key_heads, num_key_heads, head_dims
 
     q_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda") 
     k_torch = torch.randn(B, H_kv, S_kv, D, dtype=torch.float16, device="cuda")
     v_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
-    o_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda") / 50
+    o_torch = torch.randn(B, H_qo, S_qo, D, dtype=torch.float16, device="cuda")
 
     q = cutlass_torch.from_dlpack(q_torch, assumed_align=16)
     k = cutlass_torch.from_dlpack(k_torch, assumed_align=16)
@@ -597,7 +597,7 @@ if __name__ == "__main__":
     #             writer.writerow(row.tolist())
     
     # save_tensor_to_csv(o_torch, 'output_tensor.csv', D)
-    # o_torch_ref = torch.nn.functional.scaled_dot_product_attention(q_torch, k_torch, v_torch, scale=1.0 / math.sqrt(D))
+    o_torch_ref = torch.nn.functional.scaled_dot_product_attention(q_torch, k_torch, v_torch, scale=1.0 / math.sqrt(D))
     
     # # Perform all-close check row-by-row and count failures
     # failed_rows = 0
@@ -615,4 +615,4 @@ if __name__ == "__main__":
     
     # save_tensor_to_csv(o_torch_ref, 'output_tensor_ref.csv', D)
 
-    # torch.testing.assert_close(o_torch, o_torch_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(o_torch, o_torch_ref, atol=1e-3, rtol=1e-3)
