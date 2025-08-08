@@ -63,7 +63,7 @@ class HopperFA2:
         self.v_dtype = v.element_type
         self.o_dtype = o.element_type
 
-        def make_smem_layout(smem_shape: Tuple[int, int], dtype: Type[cutlass.Numeric], stages: int, layout = cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW64):
+        def make_smem_layout(smem_shape: Tuple[int, int], dtype: Type[cutlass.Numeric], stages: int, layout = cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128):
             smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
                 layout,
                 dtype,
@@ -268,17 +268,10 @@ class HopperFA2:
         gV_tiled = cute.flat_divide(gV, (self.cta_tile[2], self.cta_tile[1])) # (D, S_kv, H_kv, B)
         gO_tiled = cute.flat_divide(gO, (self.cta_tile[0], self.cta_tile[2])) # (S_qo, D, H_qo, B)
 
-        print("gV.shape", gV.shape)
-        print("cta.tiler", (self.cta_tile[2], self.cta_tile[1]))
-        print("gV_tiled.shape", gV_tiled.shape)
-
         gQ_local = gQ_tiled[*(None, None), *(bidx, None, bidy, bidz)] # (tile_M, tile_N, 1)
         gK_local = gK_tiled[*(None, None), *(None, 0, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
         gV_local = gV_tiled[*(None, None), *(0, None, bidy, bidz)] # (tile_M, tile_N, S_kv_blocks)
         gO_local = gO_tiled[*(None, None), *(bidx, None, bidy, bidz)] # (tile_M, tile_N, 1)
-
-        print("gK_local", gK_local)
-        print("gV_local", gV_local)
 
         # load q into memory.
         is_producer_warp = warp_idx in [self.load_warp_id]
@@ -359,20 +352,20 @@ class HopperFA2:
             (self.cta_tile[0], self.cta_tile[1])
         )
         tStS = cute.make_fragment(qk_acc_shape, self.acc_dtype)
+        tStS_new = cute.make_fragment_like(tStS, self.acc_dtype)
+
+        # divide tStS by \sqrt{D}
+        log2_e = math.log2(math.exp(1.0))  
+        scale_log2 = 1.0 / math.sqrt(cute.size(gQ, mode=[1])) * log2_e
+
 
         # note that we only properly partition B and C.
         # for A, we will just re-format the output later on.
         v_thr_mma = tiled_mma_v.get_slice(tidx)
         tCsV = v_thr_mma.partition_B(sV)
-
         tCrV = tiled_mma_v.make_fragment_B(tCsV)
-
-        o_acc_shape = v_thr_mma.partition_shape_C(
-            (self.cta_tile[1], self.cta_tile[2])
-        )
-        v_A_shape = v_thr_mma.partition_shape_A(
-            (self.cta_tile[1], self.cta_tile[1])
-        )
+        o_acc_shape = v_thr_mma.partition_shape_C((self.cta_tile[1], self.cta_tile[2]))
+        v_A_shape = v_thr_mma.partition_shape_A((self.cta_tile[1], self.cta_tile[1]))
         tStO = cute.make_fragment(o_acc_shape, self.acc_dtype)
         tStO.fill(0.0)
 
@@ -383,101 +376,46 @@ class HopperFA2:
             mma_q_pipeline_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
             load_q_pipeline.consumer_wait(mma_q_pipeline_state)
             load_q_pipeline.consumer_release(mma_q_pipeline_state)
-            # each thread contains the accumulator outputs from 2 separate accumulators.
-            # we need two register accumulators to store the running max and sum for each of the rows.
-            # number of rows in tStS. (this is equivalent to 2 in Hopper)
             old_row_max = cute.make_fragment((tStS.shape[0][0],), cutlass.Float32)
             old_row_max.fill(-cutlass.Float32.inf)
             running_sum = cute.make_fragment_like(old_row_max, cutlass.Float32)
             running_sum.fill(0.0)
 
-            for k_block in cutlass.range(num_kv_blocks):
+            for k_block in cutlass.range(0, num_kv_blocks):
                 load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
-                num_k_microtiles = cute.size(tCrK, mode=[2])
+                
+                self.gemm_qk(
+                    tiled_mma_qk,
+                    tStS_new,
+                    tCrQ,
+                    tCrK,
+                    mma_kv_pipeline_state.index,
+                )
 
-                # M * K = (64, 64)
-                # N * K = (64, 128)
-                tStS_new = cute.make_fragment_like(tStS, self.acc_dtype)
+                tPtP, scaling_factor = self.online_softmax(
+                    tStS_new,
+                    old_row_max,
+                    running_sum,
+                    scale_log2,
+                    False
+                )
 
-                tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-                for k_microtile_ix in cutlass.range_constexpr(num_k_microtiles, unroll=1, unroll_full=True):
-                    q_block_coord = (None, None, k_microtile_ix, 0)
-                    k_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
-                    cute.gemm(
-                        tiled_mma_qk,
-                        tStS_new,
-                        tCrQ[q_block_coord],
-                        tCrK[k_block_coord],
-                        tStS_new,
-                    )
-                    tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                cute.nvgpu.warpgroup.commit_group()
-
-                # use a composition to get the desired matrices that you want.
-                new_row_max = cute.make_fragment_like(old_row_max, cutlass.Float32)
-                scaling_factor = cute.make_fragment_like(old_row_max, cutlass.Float32)
-
-                # divide tStS by \sqrt{D}
-                log2_e = math.log2(math.exp(1.0))  
-                scale_log2 = 1.0 / math.sqrt(cute.size(gQ, mode=[1])) * log2_e
-
-                for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0]), unroll_full=True):
-                    row_tensor = tStS_new[(None, i, None), 0, 0]
+                for i in cutlass.range_constexpr(cute.size(scaling_factor, mode=[0]), unroll=1):
                     row_output = tStO[(None, i, None), 0, 0]
-
-                    row_ssa = row_tensor.load()
-                    row_max = row_ssa.reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, REDUCE_ALL_COORD)
-                    for j in cutlass.range_constexpr(2, unroll=1, unroll_full=True):
-                        row_max = cutlass.max(row_max, cute.arch.shuffle_sync_bfly(row_max, 1 << j))
-
-                    new_row_max[i] = cutlass.max(old_row_max[i], row_max)
-
-                    row_p = cute.exp2((row_ssa * scale_log2 - new_row_max[i] * scale_log2))
-
-                    row_tensor.store(row_p)
-
-                    row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, REDUCE_ALL_COORD)
-                    for j in cutlass.range_constexpr(2, unroll=1, unroll_full=True):
-                        row_sum += cute.arch.shuffle_sync_bfly(row_sum, 1 << j)
-
-                    scaling_factor[i] = cute.arch.exp2((old_row_max[i] * scale_log2 - new_row_max[i] * scale_log2))
-
-                    if k_block != 0:
-                        running_sum[i] = running_sum[i] * scaling_factor[i]
-
-                    running_sum[i] += row_sum
-
-                    if k_block != 0:
-                        row_output.store(row_output.load() * scaling_factor[i])
-
-                old_row_max.store(new_row_max.load())
-                tPtP_fp32 = tStS_new
-                tPtP = cute.make_fragment(tPtP_fp32.layout, self.k_dtype)
-                tPtP.store(tPtP_fp32.load().to(self.k_dtype))
+                    row_output.store(row_output.load() * scaling_factor[i])
 
                 # we re-format the tPtP we have into the shape that we need.
-                p_A_layout = cute.make_layout(v_A_shape)
-                p_A_tensor = cute.make_tensor(tPtP.iterator, p_A_layout)
-
-                # output scaling
-                num_k_microtiles = cute.size(p_A_tensor, mode=[2])
-                for k_microtile_ix in cutlass.range_constexpr(num_k_microtiles, unroll=1, unroll_full=True):
-                    p_block_coord = (None, None, k_microtile_ix)
-                    v_block_coord = (None, None, k_microtile_ix, mma_kv_pipeline_state.index)
-                    cute.gemm(
-                        tiled_mma_v,
-                        tStO,
-                        p_A_tensor[p_block_coord],
-                        tCrV[v_block_coord],
-                        tStO,
-                    )
-                    tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-
-                # output scaling
-                cute.nvgpu.warpgroup.commit_group()
-
-                mma_kv_pipeline_state.advance()
+                tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                p_A_tensor = cute.make_tensor(tPtP.iterator, cute.make_layout(v_A_shape))
+                self.gemm_pv(
+                    tiled_mma_v,
+                    tStO,
+                    p_A_tensor,
+                    tCrV,
+                    mma_kv_pipeline_state.index,
+                )
                 load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
+                mma_kv_pipeline_state.advance()
 
             # write back the tile to global memory.
             for i in cutlass.range_constexpr(tStO.shape[0][1], unroll=1):
@@ -501,7 +439,7 @@ class HopperFA2:
             tRS_rD_layout = cute.make_layout(rD_shape[:3])
             tRS_rD = cute.make_fragment_like(tRS_rD_layout, self.o_dtype)
 
-            for i in range(cute.size(tRS_rD)):
+            for i in range(cute.size(tRS_rD), unroll=1):
                 tRS_rD[i] = tStO_fp16[i]
 
             cute.copy(tiled_copy_r2s, tRS_rD, tRS_sD[(None, None, None, 0)])
@@ -529,6 +467,99 @@ class HopperFA2:
                 bSG_gD[(None, 0)],
             )
 
+
+    @cute.jit
+    def online_softmax(
+        self,
+        tStS: cutlass.Tensor, 
+        old_row_max: cutlass.Tensor, 
+        running_sum: cutlass.Tensor, 
+        scale_log2: cutlass.Float32,
+        first_block: bool,
+    ):
+        # use a composition to get the desired matrices that you want.
+        new_row_max = cute.make_fragment_like(old_row_max, cutlass.Float32)
+        scaling_factor = cute.make_fragment_like(old_row_max, cutlass.Float32)
+        # divide tStS by \sqrt{D}
+
+        for i in cutlass.range_constexpr(cute.size(old_row_max, mode=[0]), unroll=1):
+            row_tensor = tStS[(None, i, None), 0, 0]
+
+            row_max = row_tensor.load().reduce(cute.ReductionOp.MAX, -cutlass.Float32.inf, REDUCE_ALL_COORD)
+            for j in cutlass.range_constexpr(2, unroll=1):
+                row_max = cutlass.max(row_max, cute.arch.shuffle_sync_bfly(row_max, 1 << j))
+            new_row_max[i] = cutlass.max(old_row_max[i], row_max)
+
+            row_p = cute.exp2((row_tensor.load() * scale_log2 - new_row_max[i] * scale_log2))
+            row_tensor.store(row_p)
+
+            row_sum = row_p.reduce(cute.ReductionOp.ADD, 0.0, REDUCE_ALL_COORD)
+            for j in cutlass.range_constexpr(2, unroll=1):
+                row_sum += cute.arch.shuffle_sync_bfly(row_sum, 1 << j)
+
+            scaling_factor[i] = cute.arch.exp2((old_row_max[i] * scale_log2 - new_row_max[i] * scale_log2))
+
+            if not first_block:
+                running_sum[i] = running_sum[i] * scaling_factor[i]
+
+            running_sum[i] += row_sum
+
+        old_row_max.store(new_row_max.load())
+
+        tPtP_fp32 = tStS
+        tPtP = cute.make_fragment(tPtP_fp32.layout, self.k_dtype)
+        tPtP.store(tPtP_fp32.load().to(self.k_dtype))
+        return tPtP, scaling_factor
+
+    @cute.jit
+    def gemm_qk(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tStS: cutlass.Tensor,
+        tCrQ: cutlass.Tensor,
+        tCrK: cutlass.Tensor,
+        pipeline_index: int,
+    ):
+        # M * K = (64, 64)
+        tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
+        for k_microtile_ix in cutlass.range_constexpr(cute.size(tCrK, mode=[2]), unroll=1):
+            q_block_coord = (None, None, k_microtile_ix, 0)
+            k_block_coord = (None, None, k_microtile_ix, pipeline_index)
+            cute.gemm(
+                tiled_mma_qk,
+                tStS,
+                tCrQ[q_block_coord],
+                tCrK[k_block_coord],
+                tStS,
+            )
+            if k_microtile_ix == 0:
+                tiled_mma_qk.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+        cute.nvgpu.warpgroup.commit_group()
+
+        
+    @cute.jit
+    def gemm_pv(
+        self,
+        tiled_mma_v: cute.TiledMma,
+        tStO: cutlass.Tensor,
+        p_A_tensor: cutlass.Tensor,
+        tCrV: cutlass.Tensor,
+        pipeline_index: int,
+    ):
+        num_k_microtiles = cute.size(p_A_tensor, mode=[2])
+        for k_microtile_ix in cutlass.range_constexpr(num_k_microtiles, unroll=1, unroll_full=True):
+            p_block_coord = (None, None, k_microtile_ix)
+            v_block_coord = (None, None, k_microtile_ix, pipeline_index)
+            cute.gemm(
+                tiled_mma_v,
+                tStO,
+                p_A_tensor[p_block_coord],
+                tCrV[v_block_coord],
+                tStO,
+            )
+
+        # output scaling
+        cute.nvgpu.warpgroup.commit_group()
 
 
 if __name__ == "__main__":

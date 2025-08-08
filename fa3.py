@@ -379,6 +379,8 @@ class HopperFA2:
 
             tStS = cute.make_fragment(qk_acc_shape, self.acc_dtype)
             tStS_new = cute.make_fragment_like(tStS, self.acc_dtype)
+            tStS_new.fill(0.0)
+            tStS.fill(0.0)
 
             old_row_max = cute.make_fragment((tStS.shape[0][0],), cutlass.Float32)
             old_row_max.fill(-cutlass.Float32.inf)
@@ -388,27 +390,29 @@ class HopperFA2:
             log2_e = math.log2(math.exp(1.0))  
             scale_log2 = 1.0 / math.sqrt(cute.size(gQ, mode=[1])) * log2_e
 
-            # load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
+            load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
 
-            # self.gemm_qk(
-            #     tiled_mma_qk,
-            #     tStS,
-            #     tCrQ,
-            #     tCrK,
-            #     mma_kv_pipeline_state.index,
-            # )
-            # tPtP, _ = self.online_softmax(
-            #     tStS,
-            #     old_row_max,
-            #     running_sum,
-            #     scale_log2,
-            #     True,
-            # )
-            # mma_kv_pipeline_state.advance()
+            self.gemm_qk(
+                tiled_mma_qk,
+                tStS,
+                tCrQ,
+                tCrK,
+                mma_kv_pipeline_state.index,
+            )
 
-            for k_block in cutlass.range(0, num_kv_blocks):
+            tPtP, _ = self.online_softmax(
+                tStS,
+                old_row_max,
+                running_sum,
+                scale_log2,
+                True,
+            )
+            mma_kv_pipeline_state.advance()
+
+            for k_block in cutlass.range(1, num_kv_blocks):
                 load_kv_pipeline.consumer_wait(mma_kv_pipeline_state)
-                tStS_new = cute.make_fragment_like(tStS, self.acc_dtype)
+
+                # we need to wait on tStS.
                 self.gemm_qk(
                     tiled_mma_qk,
                     tStS_new,
@@ -417,24 +421,6 @@ class HopperFA2:
                     mma_kv_pipeline_state.index,
                 )
 
-                # O_{i - 1} = O_{i - 1} + PV
-
-                # cute.nvgpu.warpgroup.wait_group(1)
-                # P_i = softmax(Q_i * K_i)
-                tPtP_new, scaling_factor = self.online_softmax(
-                    tStS_new,
-                    old_row_max,
-                    running_sum,
-                    scale_log2,
-                    False
-                )
-                tPtP = tPtP_new
-
-                # cute.nvgpu.warpgroup.wait_group(0)
-                for i in cutlass.range_constexpr(cute.size(scaling_factor, mode=[0]), unroll=1):
-                    row_output = tStO[(None, i, None), 0, 0]
-                    row_output.store(row_output.load() * scaling_factor[i])
-
                 tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
                 p_A_tensor = cute.make_tensor(tPtP.iterator, cute.make_layout(pv_mma_A_input_shape))
                 self.gemm_pv(
@@ -442,24 +428,43 @@ class HopperFA2:
                     tStO,
                     p_A_tensor,
                     tCrV,
-                    mma_kv_pipeline_state.index,
+                    mma_kv_pipeline_state_lagging.index,
                 )
 
-                tPtP = tPtP_new
+                cute.nvgpu.warpgroup.wait_group(1)
+                tPtP_new, scaling_factor = self.online_softmax(
+                    tStS_new,
+                    old_row_max,
+                    running_sum,
+                    scale_log2,
+                    False
+                )
+                
+                for i in cutlass.range_constexpr(cute.size(scaling_factor, mode=[0]), unroll=1):
+                    row_output = tStO[(None, i, None), 0, 0]
+                    row_output.store(row_output.load() * scaling_factor[i])
 
-                load_kv_pipeline.consumer_release(mma_kv_pipeline_state)
+                tPtP.store(tPtP_new.load())
+
+                load_kv_pipeline.consumer_release(mma_kv_pipeline_state_lagging)
                 mma_kv_pipeline_state.advance()
                 mma_kv_pipeline_state_lagging.advance()
 
-            # p_A_tensor = cute.make_tensor(tPtP.iterator, cute.make_layout(pv_mma_A_input_shape))
-            # tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-            # self.gemm_pv(
-            #     tiled_mma_v,
-            #     tStO,
-            #     p_A_tensor,
-            #     tCrV,
-            #     mma_kv_pipeline_state_lagging.index,
-            # )
+            
+
+            cute.nvgpu.warpgroup.wait_group(0)
+
+            tiled_mma_v.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+            p_A_tensor = cute.make_tensor(tPtP.iterator, cute.make_layout(pv_mma_A_input_shape))
+            self.gemm_pv(
+                tiled_mma_v,
+                tStO,
+                p_A_tensor,
+                tCrV,
+                mma_kv_pipeline_state_lagging.index,
+            )
+
+            cute.nvgpu.warpgroup.wait_group(0)
 
             # write back the tile to global memory.
             for i in cutlass.range_constexpr(tStO.shape[0][1]):
